@@ -1,2 +1,248 @@
-# MOBO-TimeXer
-Algorithm running code
+# MOBO-TimeXer — code for reproducing the study on your own data
+
+Source code of *"A motion coupling prediction method for ultra-deepwater semi-submersible platforms based on
+multi-objective Bayesian optimization"* (Zhu, Zhang, Yang, Liu, Li, Sun). The package runs the complete workflow of the
+paper (Algorithm 1) on any multivariate time-series record: data preparation, coupling analysis, multi-objective
+Bayesian optimisation (MOBO) of MOBO-TimeXer and five benchmark models, multi-seed final training, ablation study,
+statistical comparison, tables and figures.
+
+The field records of the "Deep Sea No.1" platform are confidential and are not included. A synthetic data set
+with the same structure can be generated with `make_demo_data.py` to test the pipeline.
+
+## Files
+
+| File | Content |
+|---|---|
+| `mobo.py` | **MOBO**: decision spaces of the six models (Eq. 12), decoding, softmax task weights, Sobol initial design, batch ParEGO with augmented Chebyshev scalarisation (Eq. 15), Matérn-5/2 + white-noise Gaussian process (Eq. 16), Expected Improvement (Eq. 17), Pareto set (Eq. 14), hypervolume, knee point (Eq. 18). Model-agnostic, resumable. |
+| `models.py` | **Prediction models**: MOBO-TimeXer (shared encoder, task-specific residual heads, AR bypass, window-wise amplitude normalisation), GRU, CNN-LSTM, Non-stationary Transformer, XGBoost, ELM; common training protocol (weighted multi-task loss Eq. 11, early stopping, learning-rate reduction); metrics (Eqs. 19–22); knee configurations of Table 6. |
+| `data_pipeline.py` | Reading, cleaning, derived columns, chronological split, training-only standardisation, gap-aware sliding windows. |
+| `run_pipeline.py` | Command-line driver for all stages (audit → analysis → search → final → ablation → report). |
+| `make_demo_data.py` | Synthetic demonstration data set (5 days, 2-s sampling, 4 targets, 29 exogenous channels, one storm). |
+| `configs/demo_config.json` | Configuration for the demonstration data. |
+| `configs/paper_config.json` | Configuration used for the paper (field data; the path must point to the authorised data file). |
+| `DATASET_FORMAT.md` | Required format of your data set. |
+| `data/example_format_first20rows.csv` | First 20 rows of the demo file, to show the format. |
+| `requirements.txt` | Python dependencies. |
+
+## 1. Installation
+
+```bash
+python -m venv .venv && .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA build (or plain "pip install torch" for CPU)
+pip install -r requirements.txt
+```
+
+Tested with Python 3.11.9, PyTorch 2.6.0 (CUDA 12.4), XGBoost 3.2, scikit-learn 1.7 on Windows 11 with an
+NVIDIA RTX 4070 Laptop GPU, and with Python 3.13 / PyTorch 2.14 (CPU only) on Linux. A GPU is strongly
+recommended for the full protocol; everything also runs on a CPU.
+
+## 2. Quick start with the demonstration data
+
+```bash
+python make_demo_data.py                                             # -> data/demo_platform_motion.csv (62 MB)
+python run_pipeline.py --config configs/demo_config.json --quick     # smoke test of every stage (≈5 min on a CPU)
+python run_pipeline.py --config configs/demo_config.json             # full protocol of the paper
+```
+
+`--quick` shrinks every budget (3 Sobol points + 1 ParEGO iteration, 1–2 epochs, 2 seeds) and writes to
+`results/demo_quick/`; it only checks that everything runs. Its numbers are meaningless.
+
+## 3. Running the study on your own data
+
+**Step 1 — prepare one table** with a time column, the target columns and the exogenous columns
+(see [`DATASET_FORMAT.md`](DATASET_FORMAT.md)).
+
+**Step 2 — write a configuration file** (copy `configs/demo_config.json`). Only the `"data"` block is mandatory;
+all other settings default to the protocol of the paper:
+
+```json
+{
+  "output_dir": "../results/my_platform",
+  "data": {
+    "path": "D:/data/my_platform.csv",
+    "time_column": "time",
+    "target_columns": ["yaw", "roll", "offset", "pitch"],
+    "target_units": ["deg", "deg", "m", "deg"],
+    "exogenous_columns": "auto",
+    "exclude_columns": ["surge", "sway"],
+    "sample_seconds": 2, "lookback": 16, "horizon": 1,
+    "splits": {
+      "train":        [null, "2023-05-20 00:00:00"],
+      "val":          ["2023-05-20 00:00:00", "2023-05-23 00:00:00"],
+      "storm_test":   ["2023-05-23 00:00:00", "2023-05-25 00:00:00"],
+      "normal_test":  ["2023-05-25 00:00:00", null]
+    }
+  }
+}
+```
+
+**Step 3 — run**
+
+```bash
+python run_pipeline.py --config configs/my_config.json --quick    # check that the data are read correctly
+python run_pipeline.py --config configs/my_config.json            # full run
+```
+
+Check `results/<run>/data/data_profile.json` and `dataset_statistics.csv` first: they report the rows read and
+dropped, the recording gaps, the time range and the number of windows of every split.
+
+## 4. Stages and command-line options
+
+```
+python run_pipeline.py --config CONFIG [--stage STAGE] [--models LIST] [--seeds LIST] [--knee SOURCE] [--quick] [--output DIR]
+```
+
+| Stage | What it does | Paper |
+|---|---|---|
+| `audit` | split, statistics of every target in every split, standardisation parameters, persistence baseline | Sec. 3, Table 3 |
+| `analysis` | detrending, 4th-order zero-phase Butterworth split at 0.03 Hz, band-wise Pearson correlations, Welch PSD (8192-sample segments), low-/wave-frequency energy shares and peak periods | Sec. 4.1, Figs. 6–7, Table 4 |
+| `search` | MOBO of every selected model: Sobol design + batch ParEGO, each candidate trained under a reduced-fidelity protocol (and averaged over several seeds), Pareto set, hypervolume, knee point | Sec. 2.2, 4.2, Table 5, Figs. 8–9 |
+| `final` | knee configuration of every model retrained on the full training segment with seeds 0–9; metrics on every test split; window-wise predictions; model weights | Sec. 4.3–4.4, Tables 7–8 |
+| `ablation` | A: default structure + equal weights, B: knee structure + equal weights, C: independent single-task TimeXers, D: MOBO-TimeXer (all with the same seeds) | Sec. 4.4.2, Table 9 |
+| `report` | mean, SD, CV, 95 % CI over seeds; Welch t-tests (and Mann–Whitney U, Cohen's d) of MOBO-TimeXer vs. every benchmark with Holm correction; seed ensembles; improvement over the best benchmark and over persistence; MOBO summary; knee configurations; training cost; figures; one Excel workbook | Tables 5–9, Figs. 8–15 |
+| `all` (default) | audit → analysis → search → final → ablation (if `"ablation": {"enabled": true}`) → report | |
+
+| Option | Meaning |
+|---|---|
+| `--models timexer,xgboost` | subset of `timexer, xgboost, elm, gru, cnn_lstm, nonstationary_transformer` |
+| `--seeds 0-9` / `--seeds 0,4,7` | seeds of the final training and of the ablation |
+| `--knee search` | (default) use the knee found by your own `search` stage |
+| `--knee paper` | use the knee configurations of Table 6 of the paper (skips the search) |
+| `--knee my_knees.json` | use your own configurations, `{"timexer": {...}, "gru": {...}}` |
+| `--quick` | smoke test with tiny budgets |
+
+Every stage resumes: finished MOBO evaluations (`mobo_trials.csv`) and finished seeds (`metrics.csv`) are
+skipped, so an interrupted run can simply be restarted with the same command. Delete a folder to recompute it.
+Typical partial runs:
+
+```bash
+python run_pipeline.py --config C --stage search --models timexer                 # MOBO of the proposed model only
+python run_pipeline.py --config C --stage final  --models timexer,xgboost --seeds 0-4
+python run_pipeline.py --config C --stage report                                  # re-create tables and figures
+```
+
+## 5. Configuration reference (everything except the `"data"` block)
+
+Defaults (= the paper) are in `DEFAULTS` at the top of `run_pipeline.py`; a configuration file only needs the
+keys you want to change (nested dictionaries are merged).
+
+```json
+{
+  "output_dir": "results/run",
+  "models": ["timexer", "xgboost", "elm", "gru", "cnn_lstm", "nonstationary_transformer"],
+  "reference_model": "timexer",
+  "model_options": {"timexer": {"ar_bypass": true, "window_norm": true, "window_norm_eps": 0.02}},
+  "search_spaces": {},
+  "mobo": {
+    "default": {"n_init": 10, "n_iterations": 8, "batch_candidates": 2, "candidate_pool": 4096,
+                "min_distance": 0.12, "rho": 0.05, "xi": 0.001, "sobol_seed": 42, "seeds": [42],
+                "epochs": 6, "patience": 3, "batch_size": 1024,
+                "max_train_samples": 30000, "max_val_samples": 15000},
+    "timexer": {"n_iterations": 10, "sobol_seed": 2026, "seeds": [0, 1, 2],
+                "epochs": 8, "max_train_samples": 60000, "max_val_samples": 20000}
+  },
+  "final": {"seeds": [0,1,2,3,4,5,6,7,8,9], "epochs": 60, "patience": 15, "batch_size": 1024,
+            "max_train_samples": 0, "max_val_samples": 0, "save_models": true, "save_prediction_csv": true},
+  "ablation": {"enabled": false, "network": "revised", "seeds": [0,1,2,3,4,5,6,7,8,9],
+               "variants": ["A_default_equal", "B_knee_equal", "C_independent", "D_mobo"]},
+  "analysis": {"enabled": true, "conditions": {"normal": "train", "extreme": "extreme_test"},
+               "cutoff_hz": 0.03, "nperseg": 8192, "low_peak_range_hz": [0.002, 0.03]},
+  "report": {"plot_window_samples": 300, "plot_window_position": 0.5, "figure_dpi": 300}
+}
+```
+
+* `mobo.default` applies to every model, `mobo.<model>` overrides it. In the paper the five benchmarks were tuned
+  with 26 evaluations and one seed (30,000/15,000 windows, 6 epochs) and MOBO-TimeXer with 30 evaluations and three
+  seeds (60,000/20,000 windows, 8 epochs). **For a fully symmetric comparison on new data, give all models the same
+  budget**, e.g. move the `timexer` settings into `default` and delete the `timexer` entry.
+* `max_train_samples` / `max_val_samples`: number of windows, chosen evenly spaced in time (0 = all).
+* `search_spaces`: replace a decision space, same format as `mobo.SEARCH_SPACES`, e.g.
+  `"gru": [["units", "choice", [64, 128, 256]], ["num_layers", "choice", [1, 2]], ["dropout", "uniform", [0, 0.3]], ["head_units", "choice", [16, 32]], ["learning_rate", "log", [1e-4, 3e-3]]]`.
+  Patch lengths that do not divide `lookback` are removed automatically.
+* `model_options.timexer`: `ar_bypass` / `window_norm` switch the two components of Section 2.1.2; both `false`
+  gives the original network. `ablation.network = "original"` runs the ablation with the original network, as in the paper.
+* `analysis.conditions`: label → split used for the coupling analysis (paper: training segment vs. typhoon segment).
+* The MOBO objective vector is the validation NMSE of every target (Eq. 13), averaged over `seeds`; with K targets,
+  MOBO-TimeXer has 8 + K decision variables.
+
+## 6. Outputs
+
+```
+results/<run>/
+├── run_log.txt, resolved_config.json
+├── data/        data_profile.json, dataset_statistics.csv (Table 3), normalization_statistics.csv, persistence_metrics.csv
+├── analysis/    band_correlations.csv, band_energy.csv (Table 4), Fig_band_correlations.png (Fig. 6), Fig_power_spectra.png (Fig. 7)
+├── mobo/<model>/
+│     optimizer_config.json      search space and budget
+│     mobo_trials.csv            every evaluation: configuration, z-vector, objective per target, Pareto flag
+│     mobo_trials_per_seed.csv   objectives of every seed of every evaluation
+│     mobo_iteration_summary.csv hypervolume (fixed reference), Pareto size, best values after each iteration
+│     pareto_front.csv, best_config.json (knee point; also the knee under L1 and Chebyshev distance)
+├── final/<model>/seed_XX/
+│     metrics.csv                MSE, RMSE, MAE, NMSE, R², sMAPE, bias per target + average (val and every test split)
+│     predictions_<split>.csv    time, observed, predicted, error per target (physical units)
+│     predictions.npz            row indices and predictions of every split
+│     training_history.csv, run_info.json, model.pt / model_elm.npz / model_xgb_target*.json
+├── ablation/<variant>/seed_XX/  same files as final/
+└── report/
+      table_<split>.csv          mean ± SD of MSE, MAE, NMSE, R² (Tables 7, 8)
+      seed_summary.csv           mean, SD, CV, 95 % CI, min, max of every metric
+      significance.csv           Welch t (Holm-adjusted), Mann–Whitney U, Cohen's d vs. the reference model
+      improvement.csv            reduction of the average NMSE vs. the best benchmark and vs. persistence
+      ensemble_metrics.csv, persistence.csv, seed_metrics.csv
+      mobo_summary.csv (Table 5), knee_configs.csv (Table 6), cost.csv (Table 9)
+      ablation_summary.csv, ablation_significance.csv (Table 9)
+      Fig_MOBO_convergence.png (Fig. 8), Fig_hyperparameter_landscape.png (Fig. 9),
+      Fig_targetwise_<split>.png (Figs. 10, 13), Fig_timeseries_<split>.png (Figs. 11, 12, 14, 15)
+      results_summary.xlsx       all tables in one workbook
+```
+
+## 7. Using the modules directly
+
+```python
+import data_pipeline as DP, models as M, mobo as MB
+
+data = DP.load_dataset(DP.DataConfig.from_dict({...}))           # the "data" block as a dict
+wd = M.WindowData(data)                                           # data on the GPU, windows cut on the fly
+protocol = dict(epochs=60, patience=15, batch_size=1024, max_train_samples=0, max_val_samples=0)
+tm = M.train_model("timexer", data, wd, M.PAPER_KNEE_CONFIGS["timexer"], protocol, seed=0,
+                   model_options={"ar_bypass": True, "window_norm": True})
+idx, pred_std = tm.predict(data, wd, "normal_test")               # standardised predictions
+pred = data.standardizer.inverse_targets(pred_std)                # physical units
+rows = M.regression_metrics(data.raw_features[idx, :data.n_targets], pred, data.target_scale,
+                            data.target_names, data.target_units, "normal_test", "MOBO-TimeXer")
+
+# reload a saved network
+net = M.TimeXer(data.lookback, data.n_features, data.n_targets, ar_bypass=True, window_norm=True,
+                **{k: v for k, v in M.PAPER_KNEE_CONFIGS["timexer"].items() if k not in ("learning_rate", "task_weights")})
+net.load_state_dict(torch.load("results/<run>/final/timexer/seed_00/model.pt")); net.eval()
+# input: standardised window [batch, L, n_targets + n_exogenous] (targets first) -> output: standardised y(t+h)
+```
+
+`mobo.run_parego` can optimise any other model: supply `decode_fn(z) -> config` and
+`evaluate_fn(config, trial) -> {"objectives": [...], "seconds": s, "params": n}`.
+
+## 8. Reproducibility and run time
+
+* Data split, standardisation and window construction reproduce the paper exactly: with `configs/paper_config.json`
+  the pipeline gives 1,015,597 / 86,400 / 86,400 / 64,505 training / validation / extreme-test / normal-test windows,
+  the first MOBO-TimeXer evaluation reproduces the archived validation NMSE of all three seeds to six decimals, and
+  the final MOBO-TimeXer run with seed 0 reproduces the archived test NMSE of every target (86,376 parameters).
+* Training is deterministic for a given seed, GPU type and library version (cuDNN deterministic mode, fixed
+  generators). Different GPUs, CPU training or other library versions change individual seeds slightly; the
+  conclusions should be drawn from the multi-seed statistics, as in the paper.
+* Attention models are trained with the whole step recorded as a CUDA graph on the GPU (identical mathematics,
+  removes launch overhead); pass `cuda_graph=False` to `models.fit_torch` to disable it.
+* Run time on an RTX 4070 Laptop GPU with 1.0 M training windows: MOBO of MOBO-TimeXer (30 configurations × 3 seeds)
+  ≈ 7 min; one final MOBO-TimeXer run ≈ 3–5 min; XGBoost (GPU, 4 × 1000 trees) a few minutes per seed;
+  the full study with 6 models × 10 seeds takes several hours. On the 130 k-window demo data everything is about
+  eight times faster.
+
+## 9. Citation
+
+If you use this code, please cite the paper (journal details to be added after publication).
+Field data can be requested from the corresponding author, subject to the operator's approval.
+
+## License
+
+Released under the MIT License (see `LICENSE`). The field data are not covered by this license.
