@@ -1,4 +1,4 @@
-"""Data loading, cleaning, chronological split, training-only standardisation and gap-aware windows (Sec. 3.2)."""
+"""Data loading, cleaning, chronological split, training-only standardisation and gap-aware windows ."""
 from __future__ import annotations
 
 import hashlib
