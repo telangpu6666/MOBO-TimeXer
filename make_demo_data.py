@@ -1,18 +1,7 @@
-"""Generate a synthetic demonstration data set with the same structure as the field records used in the paper.
+"""Synthetic demo data with the structure of the paper's records (2-s sampling, 4 targets, 29 exogenous channels,
+one storm, one recording gap). Not field data.
 
-The field monitoring data of the platform are confidential. This script produces a physically flavoured,
-entirely synthetic record so that the whole pipeline can be run and checked end to end:
-
-* 2-s sampling, 5 days (216,000 rows) with one 560-s recording gap;
-* 4 targets: yaw deviation, roll, total horizontal offset, pitch (columns yaw_deg, roll_deg, total_offset_m, pitch_deg);
-* 29 exogenous channels: 13 wind / wave / current channels + 16 mooring-line tensions;
-* surge_m and sway_m (horizontal position components; total_offset_m = hypot(surge_m, sway_m));
-* a storm on the last day (significant wave height up to ~5 m) used as the "extreme" test segment.
-
-    python make_demo_data.py                    # -> data/demo_platform_motion.csv
-    python make_demo_data.py --days 3 --out data/small.csv
-
-The numbers are NOT field data and must not be used to draw conclusions about any real platform.
+    python make_demo_data.py [--days 5] [--out data/demo_platform_motion.csv]
 """
 from __future__ import annotations
 
@@ -27,14 +16,12 @@ DT = 2.0
 
 
 def lowpass_noise(rng, n, tau_s, sd=1.0):
-    """AR(1) noise with correlation time tau_s and unit-ish standard deviation."""
     a = np.exp(-DT / tau_s)
     x = lfilter([np.sqrt(1 - a * a)], [1, -a], rng.standard_normal(n))
     return sd * x
 
 
 def resonant(x, period_s, damping=0.03):
-    """Second-order narrow-band response of input x around 1/period_s."""
     w = 2 * np.pi * DT / period_s
     r = np.exp(-damping * w)
     y = lfilter([1.0], [1.0, -2 * r * np.cos(w), r * r], x)
@@ -52,10 +39,10 @@ def main():
     n = int(a.days * 86400 / DT)
     t = pd.date_range(a.start, periods=n, freq="2s")
     hours = np.arange(n) * DT / 3600.0
-    storm_peak = (a.days - 1) * 24 + 6.0                               # last day, 06:00
+    storm_peak = (a.days - 1) * 24 + 6.0
     storm = np.exp(-0.5 * ((hours - storm_peak) / 4.0) ** 2) + 0.35 * np.exp(-0.5 * ((hours - (a.days - 2) * 24 - 14) / 5.0) ** 2)
 
-    # ---- environment (13 channels)
+    # environment
     wind_speed = np.clip(6 + 16 * storm + lowpass_noise(rng, n, 600, 1.5) + lowpass_noise(rng, n, 20, 0.8), 0, None)
     wind_dir = (230 + 40 * storm + lowpass_noise(rng, n, 4 * 3600, 20)) % 360
     hs = np.clip(0.6 + 4.2 * storm + lowpass_noise(rng, n, 1800, 0.08), 0.1, None)
@@ -64,7 +51,7 @@ def main():
     cur_speed = [np.clip(0.3 - 0.06 * k + 0.4 * storm + lowpass_noise(rng, n, 3 * 3600, 0.05), 0, None) for k in range(4)]
     cur_dir = [(320 - 10 * k + lowpass_noise(rng, n, 6 * 3600, 15)) % 360 for k in range(4)]
 
-    # ---- horizontal slow drift (surge / sway): wind + current drag through a lightly damped mooring system
+    # horizontal slow drift
     fx = 0.004 * wind_speed ** 2 * np.cos(np.radians(wind_dir)) + 2.0 * cur_speed[0] * np.cos(np.radians(cur_dir[0]))
     fy = 0.004 * wind_speed ** 2 * np.sin(np.radians(wind_dir)) + 2.0 * cur_speed[0] * np.sin(np.radians(cur_dir[0]))
     drift = lambda f, s: (lfilter([1 - np.exp(-DT / 300)], [1, -np.exp(-DT / 300)], f)
@@ -73,16 +60,16 @@ def main():
     sway = drift(fy, 1.5) + lowpass_noise(rng, n, 30, 0.05)
     total_offset = np.hypot(surge, sway)
 
-    # ---- angular motions
+    # angular motions
     yaw = 0.45 + 0.004 * (wind_dir - 230) + resonant(rng.standard_normal(n), 80, 0.1) * (0.05 + 0.25 * storm) \
         + lowpass_noise(rng, n, 1200, 0.06)
     wave_exc = rng.standard_normal(n) * hs
     roll = -0.01 + 0.03 * fy + 0.06 * resonant(wave_exc, 10.3, 0.05) + lowpass_noise(rng, n, 900, 0.08) * (1 + storm)
     pitch = -0.23 + 0.02 * fx + 0.05 * resonant(0.7 * wave_exc + 0.7 * rng.standard_normal(n) * hs, 11.4, 0.05) \
         + 0.4 * roll * storm + lowpass_noise(rng, n, 900, 0.07) * (1 + storm)
-    roll, pitch, yaw = np.round(roll, 2), np.round(pitch, 2), np.round(yaw, 2)       # sensor resolution 0.01 deg
+    roll, pitch, yaw = np.round(roll, 2), np.round(pitch, 2), np.round(yaw, 2)
 
-    # ---- 16 mooring-line tensions (4 groups of 4 lines at the four corners)
+    # 16 mooring-line tensions
     angles = np.radians(np.repeat([45, 135, 225, 315], 4) + np.tile([-6, -2, 2, 6], 4))
     tensions = {}
     for j, ang in enumerate(angles):
@@ -97,7 +84,7 @@ def main():
                        **tensions,
                        "yaw_deg": yaw, "roll_deg": roll, "total_offset_m": total_offset, "pitch_deg": pitch,
                        "surge_m": surge, "sway_m": sway})
-    # one 560-s recording gap on the last day (as in the field record)
+    # 560-s recording gap
     g0 = int(((a.days - 1) * 24 + 17.5) * 3600 / DT)
     df = df.drop(index=range(g0, g0 + 280)).reset_index(drop=True)
     out = Path(a.out)

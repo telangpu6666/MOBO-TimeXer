@@ -13,10 +13,11 @@ with the same structure can be generated with `make_demo_data.py` to test the pi
 
 | File | Content |
 |---|---|
-| `mobo.py` | **MOBO**: decision spaces of the six models (Eq. 12), decoding, softmax task weights, Sobol initial design, batch ParEGO with augmented Chebyshev scalarisation (Eq. 15), Matérn-5/2 + white-noise Gaussian process (Eq. 16), Expected Improvement (Eq. 17), Pareto set (Eq. 14), hypervolume, knee point (Eq. 18). Model-agnostic, resumable. |
+| `mobo.py` | **MOBO**: decision spaces of the six models (Eq. 12), decoding, softmax task weights, Sobol initial design, batch ParEGO with augmented Chebyshev scalarisation (Eq. 15), Matérn-5/2 + white-noise Gaussian process (Eq. 16), Expected Improvement (Eq. 17), Pareto set (Eq. 14), hypervolume, knee point (Eq. 18). **Every candidate is trained with 5 random seeds and the optimiser uses the seed-mean objectives.** Model-agnostic, resumable. |
 | `models.py` | **Prediction models**: MOBO-TimeXer (shared encoder, task-specific residual heads, AR bypass, window-wise amplitude normalisation), GRU, CNN-LSTM, Non-stationary Transformer, XGBoost, ELM; common training protocol (weighted multi-task loss Eq. 11, early stopping, learning-rate reduction); metrics (Eqs. 19–22); knee configurations of Table 6. |
 | `data_pipeline.py` | Reading, cleaning, derived columns, chronological split, training-only standardisation, gap-aware sliding windows. |
 | `run_pipeline.py` | Command-line driver for all stages (audit → analysis → search → final → ablation → report). |
+| `mobo_timexer.py` | **Complete MOBO-TimeXer framework in one runnable file** (data pipeline, TimeXer, 5-seed MOBO, knee point, multi-seed final training, test metrics); no other file of the package is needed. |
 | `make_demo_data.py` | Synthetic demonstration data set (5 days, 2-s sampling, 4 targets, 29 exogenous channels, one storm). |
 | `configs/demo_config.json` | Configuration for the demonstration data. |
 | `configs/paper_config.json` | Configuration used for the paper (field data; the path must point to the authorised data file). |
@@ -40,12 +41,23 @@ recommended for the full protocol; everything also runs on a CPU.
 
 ```bash
 python make_demo_data.py                                             # -> data/demo_platform_motion.csv (62 MB)
-python run_pipeline.py --config configs/demo_config.json --quick     # smoke test of every stage (≈5 min on a CPU)
-python run_pipeline.py --config configs/demo_config.json             # full protocol of the paper
+python run_pipeline.py --config configs/demo_config.json --quick     # smoke test of every stage (≈7 min on a CPU)
+python run_pipeline.py --config configs/demo_config.json             # full protocol
 ```
 
-`--quick` shrinks every budget (3 Sobol points + 1 ParEGO iteration, 1–2 epochs, 2 seeds) and writes to
-`results/demo_quick/`; it only checks that everything runs. Its numbers are meaningless.
+Single-file version (MOBO-TimeXer only, results in `results/demo/mobo_timexer/`):
+
+```bash
+python mobo_timexer.py --config configs/demo_config.json --quick     # smoke test (≈1–2 min on a CPU)
+python mobo_timexer.py --config configs/demo_config.json             # 5-seed MOBO + 10-seed final training
+python mobo_timexer.py --config configs/demo_config.json --stage final --knee paper    # skip the search
+```
+
+`mobo_timexer.py` options: `--stage all|search|final`, `--knee search|paper|<file.json>`, `--mobo-seeds 0-4`
+(seeds per MOBO evaluation), `--final-seeds 0-9`, `--output DIR`, `--quick`.
+
+`--quick` shrinks every budget (3 Sobol points + 1 ParEGO iteration, 1–2 epochs; `run_pipeline.py` also uses only
+2 seeds per MOBO evaluation) and writes to a `*_quick` folder; it only checks that everything runs. Its numbers are meaningless.
 
 ## 3. Running the study on your own data
 
@@ -59,7 +71,7 @@ all other settings default to the protocol of the paper:
 {
   "output_dir": "../results/my_platform",
   "data": {
-    "path": "D:/data/my_platform.csv",
+    "path": "../data/my_platform.csv",
     "time_column": "time",
     "target_columns": ["yaw", "roll", "offset", "pitch"],
     "target_units": ["deg", "deg", "m", "deg"],
@@ -135,10 +147,10 @@ keys you want to change (nested dictionaries are merged).
   "search_spaces": {},
   "mobo": {
     "default": {"n_init": 10, "n_iterations": 8, "batch_candidates": 2, "candidate_pool": 4096,
-                "min_distance": 0.12, "rho": 0.05, "xi": 0.001, "sobol_seed": 42, "seeds": [42],
+                "min_distance": 0.12, "rho": 0.05, "xi": 0.001, "sobol_seed": 42, "seeds": [0, 1, 2, 3, 4],
                 "epochs": 6, "patience": 3, "batch_size": 1024,
                 "max_train_samples": 30000, "max_val_samples": 15000},
-    "timexer": {"n_iterations": 10, "sobol_seed": 2026, "seeds": [0, 1, 2],
+    "timexer": {"n_iterations": 10, "sobol_seed": 2026,
                 "epochs": 8, "max_train_samples": 60000, "max_val_samples": 20000}
   },
   "final": {"seeds": [0,1,2,3,4,5,6,7,8,9], "epochs": 60, "patience": 15, "batch_size": 1024,
@@ -151,10 +163,14 @@ keys you want to change (nested dictionaries are merged).
 }
 ```
 
-* `mobo.default` applies to every model, `mobo.<model>` overrides it. In the paper the five benchmarks were tuned
-  with 26 evaluations and one seed (30,000/15,000 windows, 6 epochs) and MOBO-TimeXer with 30 evaluations and three
-  seeds (60,000/20,000 windows, 8 epochs). **For a fully symmetric comparison on new data, give all models the same
-  budget**, e.g. move the `timexer` settings into `default` and delete the `timexer` entry.
+* `mobo.default` applies to every model, `mobo.<model>` overrides it. `seeds`: every MOBO candidate is trained once
+  per seed (default 5 seeds, 0–4) under the reduced-fidelity protocol, and the mean validation NMSE over the seeds is
+  the objective vector seen by the Gaussian process, the Pareto set and the knee point; the per-seed values and their
+  standard deviation are stored in `mobo_trials_per_seed.csv` / `mobo_trials.csv`.
+* The published results were obtained with fewer seeds: MOBO-TimeXer three seeds (0–2), the benchmarks one seed.
+  To reproduce them exactly use `"mobo": {"timexer": {"seeds": [0, 1, 2]}, "default": {"seeds": [42]}}`
+  (or `--mobo-seeds 0-2` in `mobo_timexer.py`). **For a fully symmetric comparison on new data, give all models the
+  same budget**, e.g. move the `timexer` settings into `default` and delete the `timexer` entry.
 * `max_train_samples` / `max_val_samples`: number of windows, chosen evenly spaced in time (0 = all).
 * `search_spaces`: replace a decision space, same format as `mobo.SEARCH_SPACES`, e.g.
   `"gru": [["units", "choice", [64, 128, 256]], ["num_layers", "choice", [1, 2]], ["dropout", "uniform", [0, 0.3]], ["head_units", "choice", [16, 32]], ["learning_rate", "log", [1e-4, 3e-3]]]`.
@@ -219,22 +235,22 @@ net.load_state_dict(torch.load("results/<run>/final/timexer/seed_00/model.pt"));
 # input: standardised window [batch, L, n_targets + n_exogenous] (targets first) -> output: standardised y(t+h)
 ```
 
-`mobo.run_parego` can optimise any other model: supply `decode_fn(z) -> config` and
-`evaluate_fn(config, trial) -> {"objectives": [...], "seconds": s, "params": n}`.
+`mobo.run_parego` can optimise any other model: supply `decode_fn(z) -> config`,
+`train_eval_fn(config, seed) -> {"objectives": [...], "seconds": s, "params": n}` and `seeds=[0, 1, 2, 3, 4]`.
 
 ## 8. Reproducibility and run time
 
 * Data split, standardisation and window construction reproduce the paper exactly: with `configs/paper_config.json`
   the pipeline gives 1,015,597 / 86,400 / 86,400 / 64,505 training / validation / extreme-test / normal-test windows,
-  the first MOBO-TimeXer evaluation reproduces the archived validation NMSE of all three seeds to six decimals, and
+  the first MOBO-TimeXer evaluation reproduces the archived validation NMSE of the three published seeds to six decimals, and
   the final MOBO-TimeXer run with seed 0 reproduces the archived test NMSE of every target (86,376 parameters).
 * Training is deterministic for a given seed, GPU type and library version (cuDNN deterministic mode, fixed
   generators). Different GPUs, CPU training or other library versions change individual seeds slightly; the
   conclusions should be drawn from the multi-seed statistics, as in the paper.
 * Attention models are trained with the whole step recorded as a CUDA graph on the GPU (identical mathematics,
   removes launch overhead); pass `cuda_graph=False` to `models.fit_torch` to disable it.
-* Run time on an RTX 4070 Laptop GPU with 1.0 M training windows: MOBO of MOBO-TimeXer (30 configurations × 3 seeds)
-  ≈ 7 min; one final MOBO-TimeXer run ≈ 3–5 min; XGBoost (GPU, 4 × 1000 trees) a few minutes per seed;
+* Run time on an RTX 4070 Laptop GPU with 1.0 M training windows: MOBO of MOBO-TimeXer (30 configurations × 5 seeds)
+  ≈ 12 min; one final MOBO-TimeXer run ≈ 3–5 min; XGBoost (GPU, 4 × 1000 trees) a few minutes per seed;
   the full study with 6 models × 10 seeds takes several hours. On the 130 k-window demo data everything is about
   eight times faster.
 

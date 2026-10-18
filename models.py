@@ -1,24 +1,4 @@
-"""Prediction models of the MOBO-TimeXer study and their common training protocol (Sections 2.1, 2.3, 2.4).
-
-Models
-------
-* ``timexer``  - MOBO-TimeXer (proposed): shared TimeXer encoder (endogenous patch tokens + global token,
-  exogenous "variable-as-token" embedding, self-attention -> cross-attention -> FFN), four task-specific
-  residual heads (Eq. 10), weighted multi-task loss (Eq. 11), plus the two components of Section 2.1.2:
-  window-wise amplitude normalisation (eps = 0.02) and a zero-initialised linear autoregressive bypass.
-* ``gru``, ``cnn_lstm``, ``nonstationary_transformer`` - neural benchmarks with the same residual heads.
-* ``xgboost`` - one histogram gradient-boosted tree ensemble per target (flattened L x F window).
-* ``elm``     - extreme learning machine, random hidden layer + closed-form ridge solution.
-
-All models predict the standardised increment relative to the last observation (residual form) and
-share exactly the same input windows, targets, splits and standardisation.
-
-Training protocol (Section 2.4): Adam (eps 1e-7), batch 1024, at most 60 epochs, early stopping on the
-validation loss (patience 15, best weights restored), ReduceLROnPlateau (x0.5 after 3 epochs, min_delta 1e-4,
-min lr 1e-6). Weight initialisation follows the Keras defaults of the original implementation
-(Glorot-uniform kernels, orthogonal recurrent kernels, LSTM forget-gate bias 1, LayerNorm eps 1e-6,
-BatchNorm momentum 0.99 / eps 1e-3).
-"""
+"""Prediction models (MOBO-TimeXer and five benchmarks), common training protocol and metrics (Secs. 2.1, 2.3, 2.4)."""
 from __future__ import annotations
 
 import math
@@ -44,7 +24,7 @@ LABELS = {"timexer": "MOBO-TimeXer", "xgboost": "XGBoost", "elm": "ELM", "gru": 
 NEURAL = ("timexer", "gru", "cnn_lstm", "nonstationary_transformer")
 TABULAR = ("xgboost", "elm")
 
-# Knee-point configurations reported in Table 6 of the paper ("paper" knee source in run_pipeline.py).
+# knee configurations of Table 6
 PAPER_KNEE_CONFIGS = {
     "timexer": {"d_model": 32, "num_heads": 4, "ff_dim": 256, "num_layers": 3, "dropout": 0.16967092417631452,
                 "patch_len": 4, "head_units": 32, "learning_rate": 0.0028788475595118573,
@@ -61,12 +41,12 @@ PAPER_KNEE_CONFIGS = {
                                   "dropout": 0.006764371568774047, "projector_units": 128, "head_units": 32,
                                   "learning_rate": 0.0018272019459218294},
 }
-# Hand-set default TimeXer used as ablation variant A (no MOBO).
+# ablation variant A (no MOBO)
 DEFAULT_TIMEXER_CONFIG = {"d_model": 64, "num_heads": 4, "ff_dim": 128, "num_layers": 2, "dropout": 0.05,
                           "patch_len": 2, "head_units": 32, "learning_rate": 1e-3}
 
 
-# ====================================================================== reproducibility
+# ---------------------------------------------------------------- reproducibility
 def seed_everything(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
@@ -80,9 +60,9 @@ def seed_everything(seed: int) -> None:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-# ====================================================================== whole standardised table on the device
+# ---------------------------------------------------------------- data on the device
 class WindowData:
-    """Keeps the standardised table on the GPU and cuts windows on the fly from target-row indices."""
+    """Standardised table on the device; windows are cut on the fly from target-row indices."""
 
     def __init__(self, data: MotionData):
         self.data = data
@@ -104,10 +84,9 @@ class WindowData:
         return self.feat[idx][:, slice(0, self.n_targets) if cols is None else cols]
 
 
-# ====================================================================== building blocks
+# ---------------------------------------------------------------- building blocks
 def glorot_(module: nn.Module) -> None:
-    """Keras default initialisation: Glorot-uniform kernels, zero biases, orthogonal recurrent kernels,
-    LSTM forget-gate bias 1 (unit_forget_bias)."""
+    """Keras-style init: Glorot kernels, zero biases, orthogonal recurrent kernels, LSTM forget bias 1."""
     for m in module.modules():
         if isinstance(m, (nn.Linear, nn.Conv1d)):
             nn.init.xavier_uniform_(m.weight)
@@ -130,8 +109,7 @@ def glorot_(module: nn.Module) -> None:
 
 
 class MHA(nn.Module):
-    """Multi-head attention (q/k/v/output projections, dropout on the attention weights).
-    With ``tau``/``delta`` it is the de-stationary attention softmax(tau * QK^T / sqrt(d) + delta)."""
+    """Multi-head attention; with tau/delta: de-stationary attention softmax(tau*QK^T/sqrt(d)+delta)."""
 
     def __init__(self, d: int, h: int, dropout: float, qkv_bias: bool = True):
         super().__init__()
@@ -143,7 +121,7 @@ class MHA(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def reset_keras_mha(self) -> None:
-        """Glorot scale of keras.layers.MultiHeadAttention, whose kernels are 3-D tensors."""
+        """Glorot scale of Keras MultiHeadAttention (3-D kernels)."""
         d, h, dk = self.h * self.dk, self.h, self.dk
         a_qkv = math.sqrt(6.0 / (h * d + dk * d))
         a_out = math.sqrt(6.0 / (dk * h + d * h))
@@ -166,7 +144,7 @@ class MHA(nn.Module):
 
 
 class ResidualHeads(nn.Module):
-    """Eq. 10: one GELU hidden layer + linear output per target; output = last observation + increment."""
+    """Eq. 10: per-target GELU layer + linear output, added to the last observation."""
 
     def __init__(self, in_dim: int, n_targets: int, head_units: int):
         super().__init__()
@@ -178,25 +156,17 @@ class ResidualHeads(nn.Module):
 
 
 def _rnn_input_dropout(x, p: float, training: bool):
-    """Keras RNN input dropout: one mask shared by all time steps."""
     if not training or p <= 0:
         return x
     mask = torch.bernoulli(torch.full((x.shape[0], 1, x.shape[2]), 1.0 - p, device=x.device)) / (1.0 - p)
     return x * mask
 
 
-# ====================================================================== MOBO-TimeXer
+# ---------------------------------------------------------------- MOBO-TimeXer
 class TimeXer(nn.Module):
-    """Coupled TimeXer with shared encoder and task-specific residual heads (Fig. 1, Eqs. 4-10).
-
-    Input x: [B, L, F] standardised window, the first ``n_targets`` channels are the endogenous targets,
-    the remaining channels are exogenous. Output: [B, n_targets] standardised prediction of y(t+h).
-
-    ar_bypass   : linear AR map of the 4L anchored lagged increments -> 4 outputs, zero-initialised (Sec. 2.1.2)
-    window_norm : endogenous window divided channel-wise by s_k = sqrt(sigma_k^2 + eps^2), head increments
-                  multiplied back by s_k (similar to RevIN; eps = window_norm_eps = 0.02)
-    With both switched off the network is the original TimeXer (used for the ablation in the paper).
-    """
+    """Shared-encoder TimeXer with task-specific residual heads (Eqs. 4-10).
+    ar_bypass: zero-initialised linear AR map of the anchored lags; window_norm: window-wise amplitude
+    normalisation with eps = window_norm_eps (Sec. 2.1.2). Both off = original network."""
 
     def __init__(self, lookback, n_features, n_targets=4, *, d_model=64, num_heads=4, ff_dim=128, num_layers=2,
                  dropout=0.05, patch_len=2, head_units=32, ar_bypass=True, window_norm=True, window_norm_eps=0.02, **_):
@@ -205,11 +175,11 @@ class TimeXer(nn.Module):
             raise ValueError("lookback must be divisible by patch_len")
         self.nt = n_targets
         n_patch = lookback // patch_len
-        self.patch = nn.Conv1d(n_targets, d_model, kernel_size=patch_len, stride=patch_len)   # Eq. 4
+        self.patch = nn.Conv1d(n_targets, d_model, kernel_size=patch_len, stride=patch_len)
         self.pos = nn.Parameter(torch.empty(n_patch, d_model))
-        self.exo = nn.Linear(lookback, d_model)                                                # Eq. 5
+        self.exo = nn.Linear(lookback, d_model)
         self.blocks = nn.ModuleList()
-        for _ in range(num_layers):                                                            # Eqs. 6-8
+        for _ in range(num_layers):
             self.blocks.append(nn.ModuleDict(dict(
                 sa=MHA(d_model, num_heads, dropout), n1=nn.LayerNorm(d_model, eps=1e-6),
                 ca=MHA(d_model, num_heads, dropout), n2=nn.LayerNorm(d_model, eps=1e-6),
@@ -222,36 +192,36 @@ class TimeXer(nn.Module):
             b["sa"].reset_keras_mha()
             b["ca"].reset_keras_mha()
         self.use_ar, self.use_rev, self.eps = bool(ar_bypass), bool(window_norm), float(window_norm_eps)
-        if self.use_ar:                       # created after the encoder so that the encoder init is unchanged
+        if self.use_ar:
             self.ar = nn.Linear(n_targets * lookback, n_targets)
             nn.init.zeros_(self.ar.weight)
             nn.init.zeros_(self.ar.bias)
 
     def forward(self, x):
         raw, exo = x[:, :, : self.nt], x[:, :, self.nt:]
-        endo = raw - raw[:, -1:, :]                                         # window anchoring
-        if self.use_rev:                                                    # window-wise amplitude normalisation
+        endo = raw - raw[:, -1:, :]
+        if self.use_rev:
             s = torch.sqrt((endo - endo.mean(1, keepdim=True)).pow(2).mean(1, keepdim=True) + self.eps ** 2)
             z = endo / s
         else:
             z = endo
-        p = self.patch(z.transpose(1, 2)).transpose(1, 2) + self.pos       # patch tokens
-        e = torch.cat([p.mean(1, keepdim=True), p], dim=1)                 # [global token; patch tokens]
-        xt = self.exo(exo.transpose(1, 2))                                  # exogenous variate tokens
+        p = self.patch(z.transpose(1, 2)).transpose(1, 2) + self.pos
+        e = torch.cat([p.mean(1, keepdim=True), p], dim=1)
+        xt = self.exo(exo.transpose(1, 2))
         for b in self.blocks:
-            e = b["n1"](e + self.drop(b["sa"](e, e)))                       # endogenous self-attention
-            e = b["n2"](e + self.drop(b["ca"](e, xt)))                      # endogenous-exogenous cross-attention
-            e = b["n3"](e + b["ff2"](self.drop(F.gelu(b["ff1"](e)))))      # feed-forward
-        ctx = torch.cat([e[:, 0], e[:, -1], z[:, -1]], dim=1)              # Eq. 9
-        inc = self.heads(ctx, torch.zeros_like(raw[:, -1]))                 # head increments
+            e = b["n1"](e + self.drop(b["sa"](e, e)))
+            e = b["n2"](e + self.drop(b["ca"](e, xt)))
+            e = b["n3"](e + b["ff2"](self.drop(F.gelu(b["ff1"](e)))))
+        ctx = torch.cat([e[:, 0], e[:, -1], z[:, -1]], dim=1)
+        inc = self.heads(ctx, torch.zeros_like(raw[:, -1]))
         if self.use_rev:
             inc = inc * s[:, 0, :]
         if self.use_ar:
             inc = inc + self.ar(endo.flatten(1))
-        return raw[:, -1] + inc                                             # residual prediction
+        return raw[:, -1] + inc
 
 
-# ====================================================================== neural benchmarks
+# ---------------------------------------------------------------- neural benchmarks
 class GRUNet(nn.Module):
     def __init__(self, lookback, n_features, n_targets=4, *, units=64, num_layers=2, dropout=0.1, head_units=32, **_):
         super().__init__()
@@ -281,7 +251,7 @@ class CNNLSTMNet(nn.Module):
         glorot_(self)
 
     def forward(self, x):
-        total = self.k - 1                                                  # "same" padding
+        total = self.k - 1
         h = F.pad(x.transpose(1, 2), (total // 2, total - total // 2))
         h = self.bn(F.gelu(self.conv(h)))
         h = F.max_pool1d(h, 2).transpose(1, 2)
@@ -291,8 +261,6 @@ class CNNLSTMNet(nn.Module):
 
 
 class NSTNet(nn.Module):
-    """Non-stationary Transformer (Liu et al., 2022): series stationarisation + de-stationary attention."""
-
     def __init__(self, lookback, n_features, n_targets=4, *, d_model=64, num_heads=4, ff_dim=128, num_layers=2,
                  dropout=0.1, projector_units=64, head_units=32, **_):
         super().__init__()
@@ -330,7 +298,7 @@ BUILDERS = {"timexer": TimeXer, "gru": GRUNet, "cnn_lstm": CNNLSTMNet, "nonstati
 CUDA_GRAPH_MODELS = (TimeXer, NSTNet)
 
 
-# ====================================================================== neural training
+# ---------------------------------------------------------------- neural training
 @torch.no_grad()
 def predict_tensor(model, wd: WindowData, idx: torch.Tensor, columns=None, batch: int = 8192) -> torch.Tensor:
     model.eval()
@@ -339,13 +307,8 @@ def predict_tensor(model, wd: WindowData, idx: torch.Tensor, columns=None, batch
 
 def fit_torch(builder, wd: WindowData, config: dict, protocol: dict, seed: int, *, columns=None, target_cols=None,
               n_targets: int | None = None, log=None, cuda_graph: bool | None = None):
-    """Train a neural model. Returns (model, history DataFrame, training seconds, parameter count).
-
-    protocol: epochs, patience, batch_size, max_train_samples, max_val_samples (0 = all windows).
-    config  : model hyper-parameters + learning_rate + optional task_weights (Eq. 11, divided by their mean).
-    cuda_graph: replay the whole training step as a CUDA graph (mathematically identical to eager execution,
-                removes kernel-launch overhead of small attention models). Default: on for attention models on GPU.
-    """
+    """Returns (model, history, seconds, parameter count). cuda_graph replays each training step as a CUDA
+    graph (same mathematics, less launch overhead); default on for attention models on GPU."""
     seed_everything(seed)
     n_targets = wd.n_targets if n_targets is None else n_targets
     mcfg = {k: v for k, v in config.items() if k not in ("learning_rate", "task_weights")}
@@ -384,7 +347,7 @@ def fit_torch(builder, wd: WindowData, config: dict, protocol: dict, seed: int, 
         model.train()
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):                     # warm-up, then restore the initial state
+        with torch.cuda.stream(side):
             for _ in range(3):
                 eager_step(static_idx)
         torch.cuda.current_stream().wait_stream(side)
@@ -443,12 +406,12 @@ def fit_torch(builder, wd: WindowData, config: dict, protocol: dict, seed: int, 
                      "seconds": time.perf_counter() - t0})
         if log:
             log(f"    epoch {ep + 1:02d} loss {train_loss:.5f} val {val_loss:.5f} lr {cur_lr:.2e}")
-        if val_loss < best:                                   # early stopping (restore best weights)
+        if val_loss < best:
             best, wait = val_loss, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             wait += 1
-        if val_loss < lr_best - 1e-4:                         # ReduceLROnPlateau
+        if val_loss < lr_best - 1e-4:
             lr_best, lr_wait = val_loss, 0
         else:
             lr_wait += 1
@@ -465,9 +428,9 @@ def fit_torch(builder, wd: WindowData, config: dict, protocol: dict, seed: int, 
     return model, pd.DataFrame(hist), elapsed, params
 
 
-# ====================================================================== XGBoost / ELM
+# ---------------------------------------------------------------- XGBoost / ELM
 class ExtremeLearningMachine:
-    """Random hidden layer + ridge output weights, accumulated batch-wise (H^T H, H^T Y)."""
+    """Random hidden layer + closed-form ridge output weights."""
 
     def __init__(self, input_dim: int, hidden_units: int = 512, alpha: float = 1e-2, activation: str = "tanh",
                  seed: int = 42) -> None:
@@ -531,7 +494,6 @@ def fit_elm(data: MotionData, config: dict, protocol: dict, seed: int):
 
 
 def predict_tabular(kind: str, model, data: MotionData, split: str, maximum=0):
-    """Returns (target row indices, standardised predictions [n, n_targets])."""
     idx = select_evenly(data.split_indices[split], maximum)
     parts = []
     for s in range(0, len(idx), 8192):
@@ -542,16 +504,14 @@ def predict_tabular(kind: str, model, data: MotionData, split: str, maximum=0):
     return idx, np.concatenate(parts).astype(np.float32)
 
 
-# ====================================================================== unified interface
+# ---------------------------------------------------------------- unified interface
 class TrainedModel:
-    """A trained model of any kind with a common ``predict(split)`` interface."""
 
     def __init__(self, key, kind, obj, seconds, params, history=None, columns=None):
         self.key, self.kind, self.obj, self.seconds, self.params = key, kind, obj, seconds, params
         self.history, self.columns = history, columns
 
     def predict(self, data: MotionData, wd: WindowData | None, split: str, maximum=0, as_tensor=False):
-        """Standardised predictions for a split -> (row indices, predictions)."""
         if self.kind in NEURAL:
             idx = wd.index(split, maximum)
             p = predict_tensor(self.obj, wd, idx, self.columns)
@@ -572,9 +532,7 @@ class TrainedModel:
 
 def train_model(key: str, data: MotionData, wd: WindowData | None, config: dict, protocol: dict, seed: int,
                 model_options: dict | None = None, log=None, cuda_graph=None) -> TrainedModel:
-    """Train model ``key`` with hyper-parameters ``config`` under ``protocol`` and random seed ``seed``.
-    ``model_options`` are fixed (not searched) settings merged into the configuration,
-    e.g. {"ar_bypass": true, "window_norm": true} for MOBO-TimeXer."""
+    """model_options: fixed settings merged into config, e.g. {"ar_bypass": True, "window_norm": True}."""
     cfg = {**(model_options or {}), **config}
     if key in NEURAL:
         m, hist, sec, params = fit_torch(BUILDERS[key], wd, cfg, protocol, seed, log=log, cuda_graph=cuda_graph)
@@ -591,8 +549,7 @@ def train_model(key: str, data: MotionData, wd: WindowData | None, config: dict,
 
 def train_independent_timexer(data: MotionData, wd: WindowData, config: dict, protocol: dict, seed: int,
                               model_options: dict | None = None, log=None):
-    """Ablation variant C: one single-task TimeXer per target, each fed only with its own history and the
-    exogenous channels. Returns a list of TrainedModel (one per target)."""
+    """Ablation C: one single-task TimeXer per target (own history + exogenous channels)."""
     cfg = {k: v for k, v in {**(model_options or {}), **config}.items() if k != "task_weights"}
     out = []
     for k in range(data.n_targets):
@@ -604,9 +561,9 @@ def train_independent_timexer(data: MotionData, wd: WindowData, config: dict, pr
     return out
 
 
-# ====================================================================== metrics (Eqs. 19-22, physical units)
+# ---------------------------------------------------------------- metrics
 def regression_metrics(y_true, y_pred, train_scale, target_names, target_units, scenario, model_name):
-    """MSE, RMSE, MAE, NMSE (= MSE / training-segment variance, Eq. 22), R2, sMAPE, bias per target + macro average."""
+    """Per-target metrics + macro average; NMSE = MSE / training variance (Eq. 22)."""
     rows = []
     for k, target in enumerate(target_names):
         t, p = y_true[:, k].astype(np.float64), y_pred[:, k].astype(np.float64)

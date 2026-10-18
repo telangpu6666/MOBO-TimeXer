@@ -1,26 +1,7 @@
-"""Multi-objective Bayesian optimisation (MOBO): Sobol initial design + batch ParEGO (Section 2.2, Eqs. 12-18).
+"""Multi-objective Bayesian optimisation: Sobol design + batch ParEGO (Eqs. 12-18).
 
-Algorithm (Algorithm 1, stage 2 of the paper)
---------------------------------------------
-1. Draw ``n_init`` scrambled Sobol points in the unit hypercube [0,1]^d and evaluate them.
-2. In each of ``n_iterations`` iterations draw ``q = batch_candidates`` Dirichlet weight vectors w_j.
-   For each w_j the K objectives (range-normalised over the evaluated samples) are scalarised by the
-   augmented Chebyshev function  g = max_k w_k f_k + rho * sum_k w_k f_k            (Eq. 15)
-   and an anisotropic Matern-5/2 + white-noise Gaussian process is fitted to g      (Eq. 16).
-   Expected Improvement (Eq. 17) is maximised over ``candidate_pool`` random points, subject to a
-   minimum distance ``min_distance`` between the candidates of the same batch.
-3. After the budget is spent, the non-dominated set is extracted (Eq. 14) and the knee point is the
-   Pareto solution with minimum Euclidean distance to the ideal point after range normalisation
-   over the Pareto set (Eq. 18).
-The hypervolume (HV) of the non-dominated set is tracked with a fixed reference point
-= 1.10 x the maximum of every objective over all evaluations.
-
-The optimiser is model-agnostic: it only needs ``decode_fn(z) -> config`` and
-``evaluate_fn(config, trial) -> {"objectives": [K], "seconds": float, "params": int}``.
-Every evaluation is appended to ``mobo_trials.csv`` immediately, and an interrupted run resumes
-from that file with exactly the same random sequence.
-
-This file also holds the decision spaces used in the paper for the six models (Eq. 12, Table 6).
+Every candidate configuration is trained with several random seeds (default 5); the objective vector
+used by the optimiser is the mean over the seeds.
 """
 from __future__ import annotations
 
@@ -37,11 +18,10 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
-# ====================================================================== decision spaces of the paper
-# Each entry: (name, kind, argument). kind = "choice" (list of values), "uniform" (low, high) or
-# "log" (low, high; sampled on a logarithmic scale). The order defines the dimensions of z.
+DEFAULT_SEEDS = (0, 1, 2, 3, 4)
+
+# (name, kind, argument); kind: choice | uniform | log
 SEARCH_SPACES = {
-    # MOBO-TimeXer: 8 structural/training hyper-parameters + 4 task-weight coefficients = 12 dims (Eq. 12)
     "timexer": [
         ("d_model", "choice", [32, 48, 64, 96]),
         ("num_heads", "choice", [2, 4]),
@@ -92,51 +72,35 @@ SEARCH_SPACES = {
         ("learning_rate", "log", (3e-4, 3e-3)),
     ],
 }
-# Models whose task weights lambda are part of the decision vector (only the proposed model).
-TASK_WEIGHT_MODELS = {"timexer"}
-
-
-# ====================================================================== decoding z in [0,1]^d -> configuration
-def choice(z: float, options: list):
-    return options[min(int(z * len(options)), len(options) - 1)]
-
-
-def uniform(z: float, low: float, high: float) -> float:
-    return float(low + z * (high - low))
-
-
-def log_uniform(z: float, low: float, high: float) -> float:
-    return float(math.exp(math.log(low) + z * (math.log(high) - math.log(low))))
+TASK_WEIGHT_MODELS = {"timexer"}      # task weights are searched only for the proposed model
 
 
 def decode(space: list, z: np.ndarray) -> dict:
-    config = {}
+    cfg = {}
     for i, (name, kind, arg) in enumerate(space):
+        u = float(z[i])
         if kind == "choice":
-            config[name] = choice(float(z[i]), list(arg))
+            cfg[name] = list(arg)[min(int(u * len(arg)), len(arg) - 1)]
         elif kind == "uniform":
-            config[name] = uniform(float(z[i]), *arg)
+            cfg[name] = float(arg[0] + u * (arg[1] - arg[0]))
         elif kind == "log":
-            config[name] = log_uniform(float(z[i]), *arg)
+            cfg[name] = float(math.exp(math.log(arg[0]) + u * (math.log(arg[1]) - math.log(arg[0]))))
         else:
             raise ValueError(kind)
-    return config
+    return cfg
 
 
-def task_weights_from_unit(a: np.ndarray, temperature: float = 3.0, total: float | None = None) -> list:
-    """Softmax parameterisation of the task weights (Eq. 12): lambda = K * softmax(3 a), a in [0,1]^K.
-    Keeps every weight strictly positive and their sum fixed at K (= 4 in the paper)."""
+def task_weights_from_unit(a, temperature: float = 3.0) -> list:
+    """lambda = K * softmax(3a), a in [0,1]^K (Eq. 12)."""
     a = np.asarray(a, dtype=float)
-    total = float(len(a)) if total is None else total
     e = np.exp(temperature * a)
-    return list(total * e / e.sum())
+    return list(len(a) * e / e.sum())
 
 
-def make_decoder(space: list, n_task_weights: int = 0) -> tuple[int, Callable[[np.ndarray], dict]]:
-    """Returns (dimension, decode_fn). With ``n_task_weights > 0`` the last dimensions are task-weight coefficients."""
+def make_decoder(space: list, n_task_weights: int = 0):
     dim = len(space) + n_task_weights
 
-    def decode_fn(z: np.ndarray) -> dict:
+    def decode_fn(z):
         cfg = decode(space, z[: len(space)])
         if n_task_weights:
             cfg["task_weights"] = task_weights_from_unit(z[len(space): dim])
@@ -145,29 +109,23 @@ def make_decoder(space: list, n_task_weights: int = 0) -> tuple[int, Callable[[n
     return dim, decode_fn
 
 
-# ====================================================================== Pareto set, hypervolume, knee point
 def pareto_mask(F: np.ndarray) -> np.ndarray:
-    """Non-dominated rows of F (minimisation, Eq. 14)."""
-    n = len(F)
-    mask = np.ones(n, dtype=bool)
-    for i in range(n):
-        dominated = np.all(F <= F[i], axis=1) & np.any(F < F[i], axis=1)
-        if dominated.any():
+    mask = np.ones(len(F), dtype=bool)
+    for i in range(len(F)):
+        if (np.all(F <= F[i], axis=1) & np.any(F < F[i], axis=1)).any():
             mask[i] = False
     return mask
 
 
-def hypervolume(F: np.ndarray, reference: np.ndarray, mc_samples: int = 400_000, seed: int = 0) -> float:
-    """Hypervolume (minimisation). Exact by coordinate compression for small problems (tens of points,
-    up to ~5 objectives); Monte-Carlo estimate otherwise."""
+def hypervolume(F: np.ndarray, reference: np.ndarray, mc_samples: int = 400_000) -> float:
     P = F[pareto_mask(F)]
     P = P[np.all(P < reference, axis=1)]
     if len(P) == 0:
         return 0.0
     m = P.shape[1]
-    if (len(P) + 1) ** m > 3_000_000:                  # Monte-Carlo fallback for many objectives
+    if (len(P) + 1) ** m > 3_000_000:                 # Monte-Carlo estimate for many objectives
         lo = P.min(0)
-        u = np.random.default_rng(seed).uniform(lo, reference, size=(mc_samples, m))
+        u = np.random.default_rng(0).uniform(lo, reference, size=(mc_samples, m))
         dom = np.zeros(mc_samples, dtype=bool)
         for p in P:
             dom |= np.all(u >= p, axis=1)
@@ -175,26 +133,23 @@ def hypervolume(F: np.ndarray, reference: np.ndarray, mc_samples: int = 400_000,
     grids = [np.unique(np.r_[P[:, k], reference[k]]) for k in range(m)]
     lows = np.meshgrid(*[g[:-1] for g in grids], indexing="ij")
     widths = np.meshgrid(*[np.diff(g) for g in grids], indexing="ij")
-    cell_low = np.stack([l.ravel() for l in lows], axis=1)
-    volume = np.prod(np.stack([w.ravel() for w in widths], axis=1), axis=1)
-    covered = np.zeros(len(cell_low), dtype=bool)
+    cell = np.stack([l.ravel() for l in lows], axis=1)
+    vol = np.prod(np.stack([w.ravel() for w in widths], axis=1), axis=1)
+    cov = np.zeros(len(cell), dtype=bool)
     for p in P:
-        covered |= np.all(cell_low >= p, axis=1)
-    return float(volume[covered].sum())
+        cov |= np.all(cell >= p, axis=1)
+    return float(vol[cov].sum())
 
 
 def knee_index(F: np.ndarray, norm_ord: float = 2) -> int:
-    """Eq. 18: Pareto solution closest to the ideal point after range normalisation over the Pareto set.
-    ``norm_ord`` = 2 (Euclidean, paper), 1 (L1) or np.inf (Chebyshev) for the sensitivity check."""
+    """Eq. 18: Pareto point closest to the ideal point after range normalisation."""
     idx = np.where(pareto_mask(F))[0]
     P = F[idx]
     span = np.where(P.max(0) - P.min(0) > 0, P.max(0) - P.min(0), 1.0)
-    dist = np.linalg.norm((P - P.min(0)) / span, ord=norm_ord, axis=1)
-    return int(idx[np.argmin(dist)])
+    return int(idx[np.argmin(np.linalg.norm((P - P.min(0)) / span, ord=norm_ord, axis=1))])
 
 
-# ====================================================================== surrogate and acquisition
-def _fit_gp(Z: np.ndarray, g: np.ndarray, seed: int) -> GaussianProcessRegressor:
+def _fit_gp(Z, g, seed):
     d = Z.shape[1]
     kernel = (ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=np.full(d, 0.5), length_scale_bounds=(1e-2, 1e2), nu=2.5)
               + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-8, 1e-1)))
@@ -205,122 +160,110 @@ def _fit_gp(Z: np.ndarray, g: np.ndarray, seed: int) -> GaussianProcessRegressor
     return gp
 
 
-def expected_improvement(mu: np.ndarray, sigma: np.ndarray, best: float, xi: float) -> np.ndarray:
+def expected_improvement(mu, sigma, best, xi):
     sigma = np.maximum(sigma, 1e-12)
     imp = best - mu - xi
-    zz = imp / sigma
-    return imp * norm.cdf(zz) + sigma * norm.pdf(zz)
+    z = imp / sigma
+    return imp * norm.cdf(z) + sigma * norm.pdf(z)
 
 
-def chebyshev(Fn: np.ndarray, w: np.ndarray, rho: float) -> np.ndarray:
+def chebyshev(Fn, w, rho):
     return np.max(w * Fn, axis=1) + rho * np.sum(w * Fn, axis=1)
 
 
-# ====================================================================== main loop
-def run_parego(
-    *,
-    dim: int,
-    decode_fn: Callable[[np.ndarray], dict],
-    evaluate_fn: Callable[[dict, int], dict],
-    out_dir: str | Path,
-    objective_names: list,
-    n_init: int = 10,
-    n_iterations: int = 10,
-    batch_candidates: int = 2,
-    candidate_pool: int = 4096,
-    min_distance: float = 0.12,
-    rho: float = 0.05,
-    xi: float = 1e-3,
-    seed: int = 2026,
-    log: Callable[[str], None] = print,
-    **_,
-) -> dict:
-    """Run batch ParEGO. ``evaluate_fn(config, trial)`` must return
-    ``{"objectives": [K values to minimise], "seconds": float, "params": int}``.
-
-    Writes to ``out_dir``: mobo_trials.csv, pareto_front.csv, mobo_iteration_summary.csv, best_config.json.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    names = list(objective_names)
-    trials_csv = out_dir / "mobo_trials.csv"
-    rows: list[dict] = []
-    if trials_csv.exists():
-        rows = pd.read_csv(trials_csv, encoding="utf-8-sig").to_dict("records")
-        log(f"[MOBO] found {len(rows)} finished evaluations - resuming")
-    rng = np.random.default_rng(seed)
-    with warnings.catch_warnings():                 # n_init need not be a power of 2
+def run_parego(*, dim: int, decode_fn: Callable, train_eval_fn: Callable, out_dir, objective_names: list,
+               seeds=DEFAULT_SEEDS, n_init: int = 10, n_iterations: int = 10, batch_candidates: int = 2,
+               candidate_pool: int = 4096, min_distance: float = 0.12, rho: float = 0.05, xi: float = 1e-3,
+               sobol_seed: int = 2026, log: Callable = print, **_) -> dict:
+    """train_eval_fn(config, seed) -> {"objectives": [K], "seconds": s, "params": n}.
+    Each candidate is evaluated with every seed in ``seeds``; the surrogate sees the seed mean."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    names, seeds = list(objective_names), [int(s) for s in seeds]
+    t_csv, s_csv = out / "mobo_trials.csv", out / "mobo_trials_per_seed.csv"
+    rows = pd.read_csv(t_csv, encoding="utf-8-sig").to_dict("records") if t_csv.exists() else []
+    per_seed = pd.read_csv(s_csv, encoding="utf-8-sig").to_dict("records") if s_csv.exists() else []
+    if rows:
+        log(f"[MOBO] resuming after {len(rows)} evaluations")
+    rng = np.random.default_rng(sobol_seed)
+    with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        sobol = qmc.Sobol(dim, scramble=True, seed=seed).random(n_init)
+        sobol = qmc.Sobol(dim, scramble=True, seed=sobol_seed).random(n_init)
 
-    def do_eval(z: np.ndarray, phase: str, iteration: int) -> None:
+    def evaluate(z, phase, iteration):
         trial = len(rows)
-        config = decode_fn(z)
-        log(f"[MOBO] trial {trial:02d} ({phase}, iter {iteration}) {json.dumps(config, ensure_ascii=False)}")
-        res = evaluate_fn(config, trial)
-        f = np.asarray(res["objectives"], dtype=float)
-        rows.append({"trial": trial, "phase": phase, "iteration": iteration, "duration_seconds": res["seconds"],
-                     "parameter_or_tree_count": res["params"], "objective_sum": float(f.sum()),
-                     "objective_max": float(f.max()), "objective_mean": float(f.mean()),
-                     "config_json": json.dumps(config, sort_keys=True),
+        cfg = decode_fn(z)
+        log(f"[MOBO] trial {trial:02d} ({phase}, iter {iteration}) {json.dumps(cfg)}")
+        done = {int(r["seed"]): r for r in per_seed if int(r["trial"]) == trial}
+        F, secs, params = [], 0.0, 0
+        for s in seeds:
+            if s in done:
+                r = done[s]
+            else:
+                res = train_eval_fn(cfg, s)
+                r = {"trial": trial, "seed": s, "seconds": float(res["seconds"]), "params": int(res["params"]),
+                     **{f"NMSE_{n}": float(v) for n, v in zip(names, res["objectives"])}}
+                per_seed.append(r)
+                pd.DataFrame(per_seed).to_csv(s_csv, index=False, encoding="utf-8-sig")
+            F.append([r[f"NMSE_{n}"] for n in names])
+            secs += r["seconds"]
+            params = r["params"]
+        F = np.asarray(F, dtype=float)
+        f, sd = F.mean(0), F.std(0, ddof=1) if len(F) > 1 else np.zeros(F.shape[1])
+        rows.append({"trial": trial, "phase": phase, "iteration": iteration, "n_seeds": len(seeds),
+                     "duration_seconds": secs, "parameter_or_tree_count": params, "objective_mean": float(f.mean()),
+                     "objective_max": float(f.max()), "objective_mean_sd_over_seeds": float(F.mean(1).std(ddof=1)) if len(F) > 1 else 0.0,
+                     "config_json": json.dumps(cfg, sort_keys=True),
                      **{f"NMSE_{n}": float(v) for n, v in zip(names, f)},
+                     **{f"SD_{n}": float(v) for n, v in zip(names, sd)},
                      **{f"z{i}": float(v) for i, v in enumerate(z)}})
-        pd.DataFrame(rows).to_csv(trials_csv, index=False, encoding="utf-8-sig")
-        log(f"[MOBO]   -> validation NMSE {np.round(f, 5).tolist()}  mean={f.mean():.5f}  {res['seconds']:.1f}s")
+        pd.DataFrame(rows).to_csv(t_csv, index=False, encoding="utf-8-sig")
+        log(f"[MOBO]   -> mean of {len(seeds)} seeds {np.round(f, 5).tolist()}  avg={f.mean():.5f}  {secs:.1f}s")
 
-    # 1) Sobol initial design
     for i in range(len(rows), n_init):
-        do_eval(sobol[i], "sobol", -1)
+        evaluate(sobol[i], "sobol", -1)
 
-    # 2) batch ParEGO iterations (random numbers are replayed on resume -> identical to an uninterrupted run)
-    for it in range(n_iterations):
-        done_in_iter = sum(1 for r in rows if r["phase"] == "bayesian" and int(r["iteration"]) == it)
+    for it in range(n_iterations):                         # random draws are replayed on resume
+        done_it = sum(1 for r in rows if r["phase"] == "bayesian" and int(r["iteration"]) == it)
         seen = rows[: n_init + it * batch_candidates]
         Z = np.array([[r[f"z{i}"] for i in range(dim)] for r in seen])
         F = np.array([[r[f"NMSE_{n}"] for n in names] for r in seen])
-        fmin, fmax = F.min(0), F.max(0)
-        Fn = (F - fmin) / np.where(fmax - fmin > 0, fmax - fmin, 1.0)
-        chosen = []
-        weights_drawn = rng.dirichlet(np.ones(F.shape[1]), size=batch_candidates)
+        Fn = (F - F.min(0)) / np.where(np.ptp(F, 0) > 0, np.ptp(F, 0), 1.0)
+        W = rng.dirichlet(np.ones(F.shape[1]), size=batch_candidates)
         pool = rng.random((candidate_pool, dim))
+        chosen = []
         for j in range(batch_candidates):
-            g = chebyshev(Fn, weights_drawn[j], rho)
-            gp = _fit_gp(Z, g, seed + 100 * it + j)
-            mu, sd = gp.predict(pool, return_std=True)
-            ei = expected_improvement(mu, sd, float(g.min()), xi)
-            for c in np.argsort(-ei):
+            g = chebyshev(Fn, W[j], rho)
+            mu, sd = _fit_gp(Z, g, sobol_seed + 100 * it + j).predict(pool, return_std=True)
+            for c in np.argsort(-expected_improvement(mu, sd, float(g.min()), xi)):
                 cand = pool[c]
-                far_batch = all(np.linalg.norm(cand - other) > min_distance for other in chosen)
-                far_seen = np.min(np.linalg.norm(Z - cand, axis=1)) > 1e-6
-                if far_batch and far_seen:
+                if all(np.linalg.norm(cand - o) > min_distance for o in chosen) and np.min(np.linalg.norm(Z - cand, axis=1)) > 1e-6:
                     chosen.append(cand)
                     break
         for k, z in enumerate(chosen):
-            if k < done_in_iter:
-                continue
-            do_eval(z, "bayesian", it)
+            if k >= done_it:
+                evaluate(z, "bayesian", it)
 
-    # 3) Pareto front, hypervolume history and knee point
     trials = pd.DataFrame(rows)
     F = trials[[f"NMSE_{n}" for n in names]].to_numpy(float)
-    reference = 1.10 * F.max(0)
+    ref = 1.10 * F.max(0)
     trials["pareto"] = pareto_mask(F)
-    trials.to_csv(trials_csv, index=False, encoding="utf-8-sig")
-    trials[trials.pareto].to_csv(out_dir / "pareto_front.csv", index=False, encoding="utf-8-sig")
-    summary = []
-    for stop, label in [(n_init, -1)] + [(n_init + (it + 1) * batch_candidates, it) for it in range(n_iterations)]:
+    trials.to_csv(t_csv, index=False, encoding="utf-8-sig")
+    trials[trials.pareto].to_csv(out / "pareto_front.csv", index=False, encoding="utf-8-sig")
+    hist = []
+    for stop, lab in [(n_init, -1)] + [(n_init + (it + 1) * batch_candidates, it) for it in range(n_iterations)]:
         Fs = F[:stop]
-        summary.append({"iteration": label, "evaluations": len(Fs),
-                        "hypervolume_fixed_reference": hypervolume(Fs, reference),
-                        "pareto_size": int(pareto_mask(Fs).sum()), "best_mean_NMSE": float(Fs.mean(1).min()),
-                        "best_mean_trial": int(np.argmin(Fs.mean(1))), "best_worst_target_NMSE": float(Fs.max(1).min())})
-    pd.DataFrame(summary).to_csv(out_dir / "mobo_iteration_summary.csv", index=False, encoding="utf-8-sig")
+        hist.append({"iteration": lab, "evaluations": len(Fs), "hypervolume_fixed_reference": hypervolume(Fs, ref),
+                     "pareto_size": int(pareto_mask(Fs).sum()), "best_mean_NMSE": float(Fs.mean(1).min()),
+                     "best_mean_trial": int(np.argmin(Fs.mean(1))), "best_worst_target_NMSE": float(Fs.max(1).min())})
+    pd.DataFrame(hist).to_csv(out / "mobo_iteration_summary.csv", index=False, encoding="utf-8-sig")
     k = knee_index(F)
-    alt = {"L1": int(trials.trial[knee_index(F, 1)]), "Chebyshev": int(trials.trial[knee_index(F, np.inf)])}
-    best = {"selection_rule": "Pareto knee: minimum Euclidean distance to the ideal point after range normalisation (Eq. 18)",
-            "trial": int(trials.trial[k]), "best_config": json.loads(trials.config_json[k]),
+    best = {"selection_rule": "Pareto knee, Eq. 18 (Euclidean distance to the ideal point after range normalisation)",
+            "seeds_per_evaluation": seeds, "trial": int(trials.trial[k]), "best_config": json.loads(trials.config_json[k]),
             "validation_objectives": dict(zip(names, F[k].tolist())),
-            "knee_with_other_distances": alt, "reference_point": reference.tolist(), "evaluations": len(trials)}
-    (out_dir / "best_config.json").write_text(json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")
-    log(f"[MOBO] done: {len(trials)} evaluations, {int(trials.pareto.sum())} Pareto solutions, knee = trial {best['trial']}")
+            "knee_with_other_distances": {"L1": int(trials.trial[knee_index(F, 1)]),
+                                          "Chebyshev": int(trials.trial[knee_index(F, np.inf)])},
+            "reference_point": ref.tolist(), "evaluations": len(trials)}
+    (out / "best_config.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
+    log(f"[MOBO] done: {len(trials)} evaluations x {len(seeds)} seeds, {int(trials.pareto.sum())} Pareto points, knee = trial {best['trial']}")
     return best

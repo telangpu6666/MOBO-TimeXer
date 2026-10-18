@@ -1,27 +1,11 @@
-"""End-to-end reproduction of the MOBO-TimeXer study on any data set (Algorithm 1 of the paper).
+"""MOBO-TimeXer study on any data set (Algorithm 1).
 
-Stages
-------
-  audit     data split, Table-3 statistics, standardisation parameters, persistence baseline
-  analysis  band-separated coupling analysis of the targets (Section 4.1: Welch PSD, 0.03-Hz Butterworth split,
-            Pearson correlation per band, low-/wave-frequency energy shares and peak periods)
-  search    batch-ParEGO MOBO of every model (Section 2.2; Table 5, Fig. 8, Fig. 9) -> knee configuration
-  final     knee configuration retrained on the full training segment with several seeds; metrics and
-            window-wise predictions on every test segment (Tables 7, 8)
-  ablation  A default structure + equal weights / B knee structure + equal weights /
-            C four single-task TimeXers / D MOBO-TimeXer (Table 9)
-  report    seed statistics (mean, SD, 95% CI), Welch t-tests with Holm correction, seed ensembles,
-            improvement over the best benchmark and persistence, cost table, figures, one Excel workbook
-  all       audit + analysis + search + final + (ablation if enabled) + report
-
-Usage
------
-  python make_demo_data.py                                   # optional: synthetic data set for a test run
-  python run_pipeline.py --config configs/demo_config.json --quick       # smoke test (minutes)
-  python run_pipeline.py --config configs/demo_config.json               # full protocol
-  python run_pipeline.py --config my_config.json --stage search --models timexer
-  python run_pipeline.py --config my_config.json --stage final --knee paper --seeds 0-9
-Every stage resumes from finished results (delete a result folder to recompute it).
+Stages: audit | analysis | search | final | ablation | report | all
+  python make_demo_data.py
+  python run_pipeline.py --config configs/demo_config.json --quick
+  python run_pipeline.py --config configs/demo_config.json
+  python run_pipeline.py --config my.json --stage final --knee paper --seeds 0-9
+Finished evaluations and seeds are skipped on restart.
 """
 from __future__ import annotations
 
@@ -39,10 +23,10 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import data_pipeline as DP  # noqa: E402
-import mobo as MB  # noqa: E402
+import data_pipeline as DP
+import mobo as MB
 
-M = None          # models module (imports torch) - loaded lazily so that 'audit'/'analysis' run without torch
+M = None          # loaded lazily (torch not needed for audit/analysis)
 
 
 def _models():
@@ -57,21 +41,20 @@ LABELS = {"timexer": "MOBO-TimeXer", "xgboost": "XGBoost", "elm": "ELM", "gru": 
           "nonstationary_transformer": "Non-stationary Transformer"}
 ALL_MODELS = ["timexer", "xgboost", "elm", "gru", "cnn_lstm", "nonstationary_transformer"]
 
-# ====================================================================== default settings (= the paper)
+# ---------------------------------------------------------------- defaults
 DEFAULTS = {
     "output_dir": "results/run",
     "models": ALL_MODELS,
     "reference_model": "timexer",
-    # fixed (not searched) options of the proposed network, Section 2.1.2
     "model_options": {"timexer": {"ar_bypass": True, "window_norm": True, "window_norm_eps": 0.02}},
-    "search_spaces": {},              # optional overrides of mobo.SEARCH_SPACES, same format
+    "search_spaces": {},
     "mobo": {
-        "default": {                  # benchmarks in the paper: 10 Sobol + 8 x 2 ParEGO, one seed, 30k/15k windows, 6 epochs
+        "default": {                  # every candidate is trained with 5 seeds and the objectives are averaged
             "n_init": 10, "n_iterations": 8, "batch_candidates": 2, "candidate_pool": 4096, "min_distance": 0.12,
-            "rho": 0.05, "xi": 1e-3, "sobol_seed": 42, "seeds": [42],
+            "rho": 0.05, "xi": 1e-3, "sobol_seed": 42, "seeds": [0, 1, 2, 3, 4],
             "epochs": 6, "patience": 3, "batch_size": 1024, "max_train_samples": 30000, "max_val_samples": 15000},
-        "timexer": {                  # proposed model: 10 Sobol + 10 x 2 ParEGO, three seeds, 60k/20k windows, 8 epochs
-            "n_iterations": 10, "sobol_seed": 2026, "seeds": [0, 1, 2],
+        "timexer": {
+            "n_iterations": 10, "sobol_seed": 2026,
             "epochs": 8, "max_train_samples": 60000, "max_val_samples": 20000},
     },
     "final": {"seeds": list(range(10)), "epochs": 60, "patience": 15, "batch_size": 1024,
@@ -84,7 +67,7 @@ DEFAULTS = {
 }
 
 QUICK = {
-    "mobo": {"n_init": 3, "n_iterations": 1, "seeds": [0], "epochs": 1, "patience": 1,
+    "mobo": {"n_init": 3, "n_iterations": 1, "seeds": [0, 1], "epochs": 1, "patience": 1,
              "max_train_samples": 3000, "max_val_samples": 1000},
     "final": {"seeds": [0, 1], "epochs": 2, "patience": 1, "max_train_samples": 5000, "max_val_samples": 2000},
     "ablation_seeds": [0, 1],
@@ -128,7 +111,7 @@ def write_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
-# ====================================================================== context
+# ---------------------------------------------------------------- context
 class Context:
     def __init__(self, cfg: dict, config_dir: Path, quick: bool):
         self.cfg, self.quick = cfg, quick
@@ -175,7 +158,7 @@ class Context:
         space = [(n, k, a) for n, k, a in space]
         L = self.data.lookback
         fixed = []
-        for name, kind, arg in space:                                   # keep only patch lengths that divide L
+        for name, kind, arg in space:
             if name == "patch_len" and kind == "choice":
                 arg = [p for p in arg if L % int(p) == 0] or [1]
             fixed.append((name, kind, arg))
@@ -187,7 +170,7 @@ class Context:
         return cfg
 
 
-# ====================================================================== stage: audit
+# ---------------------------------------------------------------- audit
 def persistence_metrics(ctx: Context) -> pd.DataFrame:
     d = ctx.data
     rows = []
@@ -199,7 +182,6 @@ def persistence_metrics(ctx: Context) -> pd.DataFrame:
 
 
 def _models_free_metrics(truth, pred, d, scenario, name):
-    """Same as models.regression_metrics, duplicated here so that audit runs without torch."""
     rows = []
     for k, t_name in enumerate(d.target_names):
         t, p = truth[:, k].astype(np.float64), pred[:, k].astype(np.float64)
@@ -227,7 +209,7 @@ def stage_audit(ctx: Context) -> None:
     ctx.log(f"[audit] written to {out}")
 
 
-# ====================================================================== stage: coupling analysis (Section 4.1)
+# ---------------------------------------------------------------- coupling analysis
 def stage_analysis(ctx: Context) -> None:
     from scipy import signal
     a = ctx.cfg["analysis"]
@@ -247,7 +229,7 @@ def stage_analysis(ctx: Context) -> None:
         v = d.raw_features[d.split_indices[split], : d.n_targets].astype(np.float64)
         det = signal.detrend(v, axis=0, type="linear")
         sos = signal.butter(4, cut / (fs / 2.0), btype="low", output="sos")
-        low = signal.sosfiltfilt(sos, det, axis=0)                     # zero-phase 4th-order Butterworth
+        low = signal.sosfiltfilt(sos, det, axis=0)
         wave = det - low
         comps[label] = {"low": low, "wave": wave, "raw": det}
         for comp, arr in (("low", low), ("wave", wave)):
@@ -303,12 +285,12 @@ def stage_analysis(ctx: Context) -> None:
         fig.tight_layout()
         fig.savefig(out / "Fig_power_spectra.png", dpi=dpi)
         plt.close(fig)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         ctx.log(f"[analysis] figures skipped: {e}")
     ctx.log(f"[analysis] written to {out}")
 
 
-# ====================================================================== stage: MOBO search
+# ---------------------------------------------------------------- MOBO search
 def stage_search(ctx: Context, models: list) -> None:
     m = _models()
     d, wd = ctx.data, ctx.wd
@@ -322,43 +304,34 @@ def stage_search(ctx: Context, models: list) -> None:
         if (out / "best_config.json").exists():
             ctx.log(f"[search] {key}: best_config.json exists - skipped")
             continue
-        seeds = list(budget["seeds"])
+        seeds = [int(x) for x in budget["seeds"]]
         lowfi = {k: budget[k] for k in ("epochs", "patience", "batch_size", "max_train_samples", "max_val_samples")}
         write_json(out / "optimizer_config.json", {
             "model": key, "search_space": [[n, k, a] for n, k, a in space],
             "task_weights": f"lambda = {d.n_targets}*softmax(3a), a in [0,1]^{d.n_targets}" if n_tw else "equal (not searched)",
             "decision_dimensions": dim, **budget, "low_fidelity_protocol": lowfi,
-            "objective": "mean over seeds of the validation NMSE of every target (Eq. 13)",
+            "objective": f"mean over {len(seeds)} seeds of the validation NMSE of every target (Eq. 13)",
             "fixed_model_options": ctx.model_options(key)})
-        ps_file = out / "mobo_trials_per_seed.csv"
-        per_seed = pd.read_csv(ps_file, encoding="utf-8-sig").to_dict("records") if ps_file.exists() else []
         opts = ctx.model_options(key)
 
-        def evaluate(cfg, trial, key=key, seeds=seeds, lowfi=lowfi, opts=opts, per_seed=per_seed, ps_file=ps_file):
-            objs, secs, params = [], 0.0, 0
-            for s in seeds:
-                tm = m.train_model(key, d, wd, ctx.quick_cfg(key, cfg), lowfi, s, model_options=opts)
-                if key in m.NEURAL:
-                    vi, p = tm.predict(d, wd, "val", lowfi["max_val_samples"], as_tensor=True)
-                    f = ((p - wd.targets(vi)) ** 2).mean(0).cpu().numpy()
-                else:
-                    vi, p = tm.predict(d, wd, "val", lowfi["max_val_samples"])
-                    f = ((p - d.features[vi, : d.n_targets]) ** 2).mean(0)
-                objs.append(f)
-                secs += tm.seconds
-                params = tm.params
-                per_seed.append({"trial": trial, "seed": s, "seconds": tm.seconds,
-                                 **{f"NMSE_{n}": float(v) for n, v in zip(d.target_names, f)}})
-                del tm
-                _free_gpu()
-            pd.DataFrame(per_seed).to_csv(ps_file, index=False, encoding="utf-8-sig")
-            return {"objectives": np.mean(objs, axis=0), "seconds": secs, "params": params}
+        def train_eval(cfg, seed, key=key, lowfi=lowfi, opts=opts):
+            tm = m.train_model(key, d, wd, ctx.quick_cfg(key, cfg), lowfi, seed, model_options=opts)
+            if key in m.NEURAL:
+                vi, p = tm.predict(d, wd, "val", lowfi["max_val_samples"], as_tensor=True)
+                f = ((p - wd.targets(vi)) ** 2).mean(0).cpu().numpy()
+            else:
+                vi, p = tm.predict(d, wd, "val", lowfi["max_val_samples"])
+                f = ((p - d.features[vi, : d.n_targets]) ** 2).mean(0)
+            res = {"objectives": f, "seconds": tm.seconds, "params": tm.params}
+            del tm
+            _free_gpu()
+            return res
 
         ctx.log(f"===== [search] {LABELS[key]}: {dim}-D decision space, {budget['n_init']} Sobol + "
                 f"{budget['n_iterations']} x {budget['batch_candidates']} ParEGO, seeds {seeds}")
         t0 = time.perf_counter()
-        best = MB.run_parego(dim=dim, decode_fn=decode_fn, evaluate_fn=evaluate, out_dir=out,
-                             objective_names=d.target_names, seed=budget["sobol_seed"], log=ctx.log,
+        best = MB.run_parego(dim=dim, decode_fn=decode_fn, train_eval_fn=train_eval, out_dir=out, seeds=seeds,
+                             objective_names=d.target_names, sobol_seed=budget["sobol_seed"], log=ctx.log,
                              **{k: budget[k] for k in ("n_init", "n_iterations", "batch_candidates", "candidate_pool",
                                                        "min_distance", "rho", "xi")})
         ctx.log(f"===== [search] {LABELS[key]} finished in {(time.perf_counter() - t0) / 60:.1f} min; knee trial "
@@ -370,11 +343,11 @@ def _free_gpu():
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
-# ====================================================================== stage: final multi-seed training
+# ---------------------------------------------------------------- final multi-seed training
 def knee_config(ctx: Context, key: str, source: str) -> tuple[dict, str]:
     m = _models()
     if source == "search":
@@ -420,7 +393,7 @@ def save_run(rd: Path, ctx: Context, name: str, tm_list, preds: dict, seed: int,
                                       "epochs_run": [int(h.epoch.max()) for h in hist] if hist else None})
     m = pd.DataFrame(rows)
     m.insert(2, "seed", seed)
-    m.to_csv(rd / "metrics.csv", index=False, encoding="utf-8-sig")              # written last = run complete
+    m.to_csv(rd / "metrics.csv", index=False, encoding="utf-8-sig")
     return m
 
 
@@ -431,7 +404,7 @@ def stage_final(ctx: Context, models: list, knee: str, seeds: list | None) -> No
     seeds = seeds or prot["seeds"]
     train_prot = {k: prot[k] for k in ("epochs", "patience", "batch_size", "max_train_samples", "max_val_samples")}
     splits = ["val"] + d.test_splits
-    for seed in seeds:                                   # seeds outer: every model gets some seeds early
+    for seed in seeds:
         for key in models:
             cfg, source = knee_config(ctx, key, knee)
             cfg = ctx.quick_cfg(key, cfg)
@@ -453,7 +426,7 @@ def stage_final(ctx: Context, models: list, knee: str, seeds: list | None) -> No
             _free_gpu()
 
 
-# ====================================================================== stage: ablation (Table 9)
+# ---------------------------------------------------------------- ablation
 ABLATION_LABELS = {"A_default_equal": "A: default structure + equal weights (no MOBO)",
                    "B_knee_equal": "B: knee structure + equal weights",
                    "C_independent": "C: independent single-task TimeXers (no sharing)",
@@ -482,7 +455,7 @@ def stage_ablation(ctx: Context, knee: str, seeds: list | None) -> None:
                 continue
             src = ctx.out / "final" / "timexer" / f"seed_{seed:02d}"
             if v == "D_mobo" and ab["network"] == "revised" and (src / "metrics.csv").exists() and not ctx.quick:
-                shutil.copytree(src, rd, dirs_exist_ok=True)                 # identical to the final run
+                shutil.copytree(src, rd, dirs_exist_ok=True)
                 met = pd.read_csv(rd / "metrics.csv", encoding="utf-8-sig")
                 met["model"] = ABLATION_LABELS[v]
                 met.to_csv(rd / "metrics.csv", index=False, encoding="utf-8-sig")
@@ -504,9 +477,8 @@ def stage_ablation(ctx: Context, knee: str, seeds: list | None) -> None:
             _free_gpu()
 
 
-# ====================================================================== stage: report
+# ---------------------------------------------------------------- report
 def holm(p: np.ndarray) -> np.ndarray:
-    """Holm step-down adjustment of a family of p-values."""
     p = np.asarray(p, dtype=float)
     order = np.argsort(p)
     adj = np.empty_like(p)
@@ -538,8 +510,7 @@ def seed_summary(per_seed: pd.DataFrame, metrics=("NMSE", "R2", "MSE", "RMSE", "
 
 
 def significance(per_seed: pd.DataFrame, ref: str, scenarios: list) -> pd.DataFrame:
-    """Welch t-test (and Mann-Whitney U) of the reference model against every other model on the seed-level
-    metrics; Holm correction over the comparisons within each scenario x target x metric (Section 2.4)."""
+    """Welch t-test (+ Mann-Whitney U) vs. the reference model, Holm-adjusted per scenario x target x metric."""
     from scipy import stats
     rows = []
     others = [mdl for mdl in per_seed.model.unique() if mdl != ref]
@@ -572,7 +543,6 @@ def fmt(m, s, digits=4):
 
 
 def main_tables(summ: pd.DataFrame, d: DP.MotionData, models: list) -> dict:
-    """Paper-style Tables 7/8: mean ± SD of MSE, MAE, NMSE and R2 for every target and the average."""
     out = {}
     for sc in d.test_splits:
         rows = []
@@ -627,7 +597,7 @@ def stage_report(ctx: Context, models: list) -> None:
                      "persistence": pers})
         for sc, t in main_tables(summ, d, order).items():
             tabs[f"table_{sc}"] = t
-        # improvement of the reference model over the best benchmark and persistence (average NMSE)
+        # improvement of the average NMSE
         imp = []
         for sc in d.test_splits:
             g = summ[(summ.scenario == sc) & (summ.target == "average") & (summ.metric == "NMSE")].set_index("model")
@@ -644,7 +614,7 @@ def stage_report(ctx: Context, models: list) -> None:
                             "reduction_vs_best_benchmark_pct": 100 * (1 - g.loc[ref, "mean"] / bench.loc[b, "mean"])})
             imp.append(row)
         tabs["improvement"] = pd.DataFrame(imp)
-        # computational cost (Table 9, first columns)
+        # training cost
         cost = []
         for key in models:
             infos = [json.loads(f.read_text(encoding="utf-8")) for f in sorted((ctx.out / "final" / key).glob("seed_*/run_info.json"))]
@@ -655,7 +625,7 @@ def stage_report(ctx: Context, models: list) -> None:
                              "epochs_run_mean": np.mean([np.mean(i["epochs_run"]) for i in infos]) if infos[0]["epochs_run"] else np.nan,
                              "seeds": len(infos)})
         tabs["cost"] = pd.DataFrame(cost)
-    # MOBO summaries (Table 5, Table 6)
+    # MOBO summary (Tables 5, 6)
     mobo_rows, knee_rows = [], []
     for key in models:
         f = ctx.out / "mobo" / key / "mobo_trials.csv"
@@ -691,7 +661,7 @@ def stage_report(ctx: Context, models: list) -> None:
     try:
         with pd.ExcelWriter(out / "results_summary.xlsx", engine="openpyxl") as w:
             pd.DataFrame({"content": [
-                f"data: {d.profile['source']}", f"splits: {json.dumps(d.profile['split_time_range'])}",
+                f"data: {d.profile['source_file']}", f"splits: {json.dumps(d.profile['split_time_range'])}",
                 f"windows: {json.dumps(d.profile['split_windows'])}",
                 "NMSE = MSE / training-segment variance (Eq. 22); average = macro average over the targets",
                 "seed statistics: mean, SD, CV, t-based 95% CI; significance: Welch t-test, Holm-adjusted within "
@@ -699,11 +669,11 @@ def stage_report(ctx: Context, models: list) -> None:
                 w, sheet_name="readme", index=False)
             for name, t in tabs.items():
                 t.to_excel(w, sheet_name=name[:31], index=False)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         ctx.log(f"[report] Excel workbook skipped: {e}")
     try:
         figures(ctx, models, tabs, out)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         ctx.log(f"[report] figures skipped: {type(e).__name__}: {e}")
     if "improvement" in tabs:
         for _, r in tabs["improvement"].iterrows():
@@ -750,7 +720,7 @@ def figures(ctx: Context, models: list, tabs: dict, out: Path) -> None:
         fig.tight_layout()
         fig.savefig(out / "Fig_MOBO_convergence.png", dpi=dpi)
         plt.close(fig)
-    # hyper-parameter landscape of the reference model (Fig. 9)
+    # hyper-parameter landscape (Fig. 9)
     rk = ctx.cfg["reference_model"]
     f = ctx.out / "mobo" / rk / "mobo_trials.csv"
     if f.exists():
@@ -788,7 +758,7 @@ def figures(ctx: Context, models: list, tabs: dict, out: Path) -> None:
             fig.tight_layout()
             fig.savefig(out / f"Fig_targetwise_{sc}.png", dpi=dpi)
             plt.close(fig)
-    # time-domain comparison of the seed-ensemble predictions (Figs. 11, 12, 14, 15)
+    # time series of the seed ensembles (Figs. 11-15)
     n_win, pos = int(rep["plot_window_samples"]), float(rep["plot_window_position"])
     for sc in d.test_splits:
         preds = {}
@@ -816,7 +786,7 @@ def figures(ctx: Context, models: list, tabs: dict, out: Path) -> None:
         plt.close(fig)
 
 
-# ====================================================================== CLI
+# ---------------------------------------------------------------- CLI
 def main() -> None:
     ap = argparse.ArgumentParser(description="MOBO-TimeXer: full reproduction pipeline")
     ap.add_argument("--config", required=True, help="JSON configuration file (see configs/)")
@@ -828,7 +798,7 @@ def main() -> None:
     ap.add_argument("--output", default=None, help="override output_dir")
     a = ap.parse_args()
     cfg_path = Path(a.config).resolve()
-    user = json.loads(cfg_path.read_text(encoding="utf-8-sig"))      # tolerate a BOM (Windows Notepad)
+    user = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     cfg = deep_update(DEFAULTS, user)
     if a.output:
         cfg["output_dir"] = a.output

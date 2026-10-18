@@ -11,10 +11,11 @@ multi-objective Bayesian optimization*，可在任意多变量时间序列数据
 
 | 文件 | 内容 |
 |---|---|
-| `mobo.py` | **MOBO 全部代码**：六个模型的决策空间（式 12）、解码、任务权重 softmax 参数化、Sobol 初始设计、批量 ParEGO（增广 Chebyshev 标量化，式 15）、Matérn-5/2+白噪声高斯过程（式 16）、EI 采集（式 17）、帕累托集（式 14）、超体积、膝点（式 18）；与模型无关，可断点续跑 |
+| `mobo.py` | **MOBO 全部代码**：六个模型的决策空间（式 12）、解码、任务权重 softmax 参数化、Sobol 初始设计、批量 ParEGO（增广 Chebyshev 标量化，式 15）、Matérn-5/2+白噪声高斯过程（式 16）、EI 采集（式 17）、帕累托集（式 14）、超体积、膝点（式 18）；**每个候选配置用 5 个随机种子分别训练，取 5 个种子验证 NMSE 的平均值作为目标进行评估和迭代**；与模型无关，可断点续跑 |
 | `models.py` | **预测模型全部代码**：MOBO-TimeXer（共享编码器 + 任务专属残差头 + 线性 AR 旁路 + 窗口幅值归一化）、GRU、CNN-LSTM、Non-stationary Transformer、XGBoost、ELM；统一训练协议（式 11 加权多任务损失、早停、学习率衰减）；评价指标（式 19–22）；论文表 6 的膝点配置 |
 | `data_pipeline.py` | 数据读取、清洗、派生列/修复、按时间划分、只用训练段的标准化、不跨越时间间断的滑动窗口 |
 | `run_pipeline.py` | 一键运行全部阶段的命令行入口 |
+| `mobo_timexer.py` | **MOBO-TimeXer 完整框架单文件版**（数据处理、TimeXer、5 种子 MOBO、膝点、多种子最终训练、测试指标），不依赖本包其他文件，可单独运行 |
 | `make_demo_data.py` | 生成合成演示数据（5 天、2 s 采样、4 个目标、29 个外生通道、1 次风暴过程） |
 | `configs/demo_config.json` | 演示数据的配置文件 |
 | `configs/paper_config.json` | 论文所用配置（现场数据，路径需指向授权数据文件） |
@@ -54,9 +55,20 @@ pip install -r requirements.txt
 
 ```bash
 python make_demo_data.py                                             # 生成演示数据
-python run_pipeline.py --config configs/demo_config.json --quick     # 冒烟测试（所有阶段，CPU 约 5 分钟，数值无意义）
-python run_pipeline.py --config configs/demo_config.json             # 按论文协议完整运行
+python run_pipeline.py --config configs/demo_config.json --quick     # 冒烟测试（所有阶段，CPU 约 7 分钟，数值无意义）
+python run_pipeline.py --config configs/demo_config.json             # 完整运行
 ```
+
+单文件版（只含 MOBO-TimeXer，结果在 `results/demo/mobo_timexer/`）：
+
+```bash
+python mobo_timexer.py --config configs/demo_config.json --quick     # 冒烟测试（CPU 约 1–2 分钟）
+python mobo_timexer.py --config configs/demo_config.json             # 5 种子 MOBO 寻优 + 10 种子最终训练
+python mobo_timexer.py --config configs/demo_config.json --stage final --knee paper    # 跳过寻优，用论文膝点
+```
+
+单文件版参数：`--stage all|search|final`、`--knee search|paper|文件.json`、`--mobo-seeds 0-4`（每次寻优评估的种子）、
+`--final-seeds 0-9`、`--output 目录`、`--quick`。
 
 用自己的数据：复制 `configs/demo_config.json`，修改 `"data"` 部分（文件路径、时间列、目标列、外生列、采样间隔、划分），
 其余设置不写则默认采用论文协议；先用 `--quick` 检查 `results/<run>/data/data_profile.json` 中的行数、间断和各段窗口数，再完整运行。
@@ -76,8 +88,12 @@ python run_pipeline.py --config configs/demo_config.json             # 按论文
 
 ## 5. 主要可调设置
 
-* `mobo.default`（对比模型，论文：10 Sobol + 8×2 ParEGO、1 个种子、30,000/15,000 窗口、6 轮）与
-  `mobo.timexer`（论文：10 Sobol + 10×2 ParEGO、3 个种子、60,000/20,000 窗口、8 轮）。
+* `mobo.default`（对比模型：10 Sobol + 8×2 ParEGO、30,000/15,000 窗口、6 轮）与
+  `mobo.timexer`（10 Sobol + 10×2 ParEGO、60,000/20,000 窗口、8 轮）。`seeds` 默认 `[0, 1, 2, 3, 4]`：每个候选配置用
+  5 个种子分别做低保真训练，高斯过程、帕累托集和膝点都基于 5 个种子的平均验证 NMSE；逐种子结果和标准差保存在
+  `mobo_trials_per_seed.csv` / `mobo_trials.csv`。
+* 论文已发表的结果用的种子更少（MOBO-TimeXer 3 个种子 0–2，对比模型 1 个种子）；要逐位复现论文数值，设
+  `"mobo": {"timexer": {"seeds": [0, 1, 2]}, "default": {"seeds": [42]}}`（单文件版用 `--mobo-seeds 0-2`）。
   **在新数据上做完全对称的比较时，建议所有模型使用同一预算**（把 `timexer` 的设置移到 `default`）。
 * `final`：最终训练协议（论文：种子 0–9，最多 60 轮，早停耐心 15，批大小 1024，全部训练/验证窗口）。
 * `model_options.timexer`：`ar_bypass`、`window_norm` 控制 2.1.2 节的两个组件，均为 `false` 即原始网络。
@@ -93,10 +109,10 @@ python run_pipeline.py --config configs/demo_config.json             # 按论文
 ## 7. 复现性
 
 * 用 `configs/paper_config.json` 读取论文数据时，训练/验证/极端测试/常规测试窗口数为 1,015,597 / 86,400 / 86,400 / 64,505，
-  与论文一致；MOBO-TimeXer 第一个寻优配置三个种子的验证 NMSE 与归档结果在小数点后 6 位一致；
+  与论文一致；MOBO-TimeXer 第一个寻优配置（论文所用 3 个种子）的验证 NMSE 与归档结果在小数点后 6 位一致；
   膝点配置种子 0 的最终训练在两个测试段上各目标 NMSE 与归档结果一致（参数量 86,376）。
 * 同一种子、同一 GPU 和库版本下训练是确定性的；换 GPU、用 CPU 或换库版本时单个种子的数值会略有差别，结论应以多种子统计为准。
-* 运行时间（RTX 4070 Laptop GPU，约 100 万训练窗口）：MOBO-TimeXer 寻优约 7 分钟，单次最终训练约 3–5 分钟，6 个模型 × 10 个种子共需数小时。
+* 运行时间（RTX 4070 Laptop GPU，约 100 万训练窗口）：MOBO-TimeXer 寻优（30 组 × 5 种子）约 12 分钟，单次最终训练约 3–5 分钟，6 个模型 × 10 个种子共需数小时。
 
 ## 8. 许可证
 
