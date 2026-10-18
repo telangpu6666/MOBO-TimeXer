@@ -1,5 +1,4 @@
-"""Synthetic demo data with the structure of the paper's records (2-s sampling, 4 targets, 29 exogenous channels,
-one storm, one recording gap). Not field data.
+"""Synthetic demo data with the structure of the paper's records. Not field data.
 
     python make_demo_data.py [--days 5] [--out data/demo_platform_motion.csv]
 """
