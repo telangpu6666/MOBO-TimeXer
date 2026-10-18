@@ -4,10 +4,10 @@ Source code of *"A motion coupling prediction method for ultra-deepwater semi-su
 multi-objective Bayesian optimization"* (Zhu, Zhang, Yang, Liu, Li, Sun). The package runs the complete workflow of the
 paper (Algorithm 1) on any multivariate time-series record: data preparation, coupling analysis, multi-objective
 Bayesian optimisation (MOBO) of MOBO-TimeXer and five benchmark models, multi-seed final training, ablation study,
-statistical comparison, tables and figures.
+statistical comparison.
 
-The field records of the "Deep Sea No.1" platform are confidential and are not included. A synthetic data set
-with the same structure can be generated with `make_demo_data.py` to test the pipeline.
+The field records of the "xxx" platform are confidential and are not included. A synthetic data set
+with the same structure can be used to test the pipeline.
 
 ## Files
 
@@ -18,7 +18,7 @@ with the same structure can be generated with `make_demo_data.py` to test the pi
 | `data_pipeline.py` | Reading, cleaning, derived columns, chronological split, training-only standardisation, gap-aware sliding windows. |
 | `run_pipeline.py` | Command-line driver for all stages (audit → analysis → search → final → ablation → report). |
 | `mobo_timexer.py` | **Complete MOBO-TimeXer framework in one runnable file** (data pipeline, TimeXer, 5-seed MOBO, knee point, multi-seed final training, test metrics); no other file of the package is needed. |
-| `make_demo_data.py` | Synthetic demonstration data set (5 days, 2-s sampling, 4 targets, 29 exogenous channels, one storm). |
+| `make_demo_data.py` | Synthetic demonstration data set . |
 | `configs/demo_config.json` | Configuration for the demonstration data. |
 | `configs/paper_config.json` | Configuration used for the paper (field data; the path must point to the authorised data file). |
 | `DATASET_FORMAT.md` | Required format of your data set. |
@@ -33,8 +33,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA bu
 pip install -r requirements.txt
 ```
 
-Tested with Python 3.11.9, PyTorch 2.6.0 (CUDA 12.4), XGBoost 3.2, scikit-learn 1.7 on Windows 11 with an
-NVIDIA RTX 4070 Laptop GPU, and with Python 3.13 / PyTorch 2.14 (CPU only) on Linux. A GPU is strongly
+Tested with Python 3.11, PyTorch 2.6.0 (CUDA 12.4), XGBoost 3.2, scikit-learn 1.7 on Windows 11 with an
+NVIDIA RTX 4070 GPU, and with Python 3.13 / PyTorch 2.14 (CPU only) on Linux. A GPU is strongly
 recommended for the full protocol; everything also runs on a CPU.
 
 ## 2. Quick start with the demonstration data
@@ -49,7 +49,7 @@ Single-file version (MOBO-TimeXer only, results in `results/demo/mobo_timexer/`)
 
 ```bash
 python mobo_timexer.py --config configs/demo_config.json --quick     # smoke test (≈1–2 min on a CPU)
-python mobo_timexer.py --config configs/demo_config.json             # 5-seed MOBO + 10-seed final training
+python mobo_timexer.py --config configs/demo_config.json             # 5-seed MOBO + 20-seed final training
 python mobo_timexer.py --config configs/demo_config.json --stage final --knee paper    # skip the search
 ```
 
