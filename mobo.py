@@ -1,4 +1,4 @@
-"""Multi-objective Bayesian optimisation: Sobol design + batch ParEGO (Eqs. 12-18).
+"""Multi-objective Bayesian optimisation: Sobol design + batch ParEGO .
 
 Every candidate configuration is trained with several random seeds (default 5); the objective vector
 used by the optimiser is the mean over the seeds.
