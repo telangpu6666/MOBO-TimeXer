@@ -1,4 +1,4 @@
-"""Prediction models (MOBO-TimeXer and five benchmarks), common training protocol and metrics (Secs. 2.1, 2.3, 2.4)."""
+"""Prediction models (MOBO-TimeXer and five benchmarks), common training protocol and metrics."""
 from __future__ import annotations
 
 import math
@@ -24,22 +24,6 @@ LABELS = {"timexer": "MOBO-TimeXer", "xgboost": "XGBoost", "elm": "ELM", "gru": 
 NEURAL = ("timexer", "gru", "cnn_lstm", "nonstationary_transformer")
 TABULAR = ("xgboost", "elm")
 
-# knee configurations of Table 6
-PAPER_KNEE_CONFIGS = {
-    "timexer": {"d_model": 32, "num_heads": 4, "ff_dim": 256, "num_layers": 3, "dropout": 0.16967092417631452,
-                "patch_len": 4, "head_units": 32, "learning_rate": 0.0028788475595118573,
-                "task_weights": [0.3121030773375151, 2.73929283782137, 0.2651447507096903, 0.683459334131425]},
-    "xgboost": {"n_estimators": 1000, "max_depth": 4, "learning_rate": 0.03472391831035434,
-                "subsample": 0.7119709012955899, "colsample_bytree": 0.7059964653418797,
-                "min_child_weight": 18.863481682220762, "reg_lambda": 0.017015462702041875},
-    "elm": {"hidden_units": 1024, "alpha": 7.54939031448198, "activation": "sigmoid"},
-    "gru": {"units": 128, "num_layers": 3, "dropout": 0.008510000543135264, "head_units": 16,
-            "learning_rate": 0.0015734330168744731},
-    "cnn_lstm": {"filters": 32, "kernel_size": 5, "lstm_units": 64, "dropout": 0.2681555184535682, "head_units": 16,
-                 "learning_rate": 0.002737518746357635},
-    "nonstationary_transformer": {"d_model": 48, "num_heads": 2, "ff_dim": 64, "num_layers": 1,
-                                  "dropout": 0.006764371568774047, "projector_units": 128, "head_units": 32,
-                                  "learning_rate": 0.0018272019459218294},
 }
 # ablation variant A (no MOBO)
 DEFAULT_TIMEXER_CONFIG = {"d_model": 64, "num_heads": 4, "ff_dim": 128, "num_layers": 2, "dropout": 0.05,
