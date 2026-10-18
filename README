@@ -241,17 +241,16 @@ net.load_state_dict(torch.load("results/<run>/final/timexer/seed_00/model.pt"));
 ## 8. Reproducibility and run time
 
 * Data split, standardisation and window construction reproduce the paper exactly: with `configs/paper_config.json`
-  the pipeline gives 1,015,597 / 86,400 / 86,400 / 64,505 training / validation / extreme-test / normal-test windows,
+  the pipeline gives training / validation / extreme-test / normal-test windows,
   the first MOBO-TimeXer evaluation reproduces the archived validation NMSE of the three published seeds to six decimals, and
-  the final MOBO-TimeXer run with seed 0 reproduces the archived test NMSE of every target (86,376 parameters).
-* Training is deterministic for a given seed, GPU type and library version (cuDNN deterministic mode, fixed
-  generators). Different GPUs, CPU training or other library versions change individual seeds slightly; the
+  the final MOBO-TimeXer run with seed 0 reproduces the archived test NMSE of every target .
+* Training is deterministic for a given seed, GPU type and library version . Different GPUs, CPU training or other library versions change individual seeds slightly; the
   conclusions should be drawn from the multi-seed statistics, as in the paper.
 * Attention models are trained with the whole step recorded as a CUDA graph on the GPU (identical mathematics,
   removes launch overhead); pass `cuda_graph=False` to `models.fit_torch` to disable it.
 * Run time on an RTX 4070 Laptop GPU with 1.0 M training windows: MOBO of MOBO-TimeXer (30 configurations × 5 seeds)
-  ≈ 12 min; one final MOBO-TimeXer run ≈ 3–5 min; XGBoost (GPU, 4 × 1000 trees) a few minutes per seed;
-  the full study with 6 models × 10 seeds takes several hours. On the 130 k-window demo data everything is about
+   one final MOBO-TimeXer run ; XGBoost a few minutes per seed;
+  the full study with 6 models × 20 seeds takes several hours. On the 130 k-window demo data everything is about
   eight times faster.
 
 ## 9. Citation
