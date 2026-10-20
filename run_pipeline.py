@@ -57,7 +57,7 @@ DEFAULTS = {
             "n_iterations": 10, "sobol_seed": 2026,
             "epochs": 8, "max_train_samples": 60000, "max_val_samples": 20000},
     },
-    "final": {"seeds": list(range(10)), "epochs": 60, "patience": 15, "batch_size": 1024,
+    "final": {"seeds": list(range(20)), "epochs": 60, "patience": 15, "batch_size": 1024,
               "max_train_samples": 0, "max_val_samples": 0, "save_models": True, "save_prediction_csv": True},
     "ablation": {"enabled": False, "network": "revised", "seeds": list(range(10)),
                  "variants": ["A_default_equal", "B_knee_equal", "C_independent", "D_mobo"]},
