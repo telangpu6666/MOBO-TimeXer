@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+results/
+_cache/
+data/*.csv
+!data/example_format_first20rows.csv
