@@ -38,7 +38,7 @@ DEFAULTS = {
     "mobo": {"seeds": [0, 1, 2, 3, 4], "n_init": 10, "n_iterations": 10, "batch_candidates": 2, "candidate_pool": 4096,
              "min_distance": 0.12, "rho": 0.05, "xi": 1e-3, "sobol_seed": 2026,
              "epochs": 8, "patience": 3, "batch_size": 1024, "max_train_samples": 60000, "max_val_samples": 20000},
-    "final": {"seeds": list(range(10)), "epochs": 60, "patience": 15, "batch_size": 1024,
+    "final": {"seeds": list(range(20)), "epochs": 60, "patience": 15, "batch_size": 1024,
               "max_train_samples": 0, "max_val_samples": 0},
 }
 QUICK = {"mobo": {"n_init": 3, "n_iterations": 1, "epochs": 1, "patience": 1, "max_train_samples": 3000,
